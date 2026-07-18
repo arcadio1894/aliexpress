@@ -389,7 +389,7 @@
             <a href="{{ route('dashboard.principal') }}"><i class="fa fa-home"></i> Dashboard</a>
         </li>
         <li class="breadcrumb-item">
-            <a href="{{ route('entry.purchase.index') }}"><i class="fa fa-archive"></i> Punto de venta</a>
+            <a href="{{ route('puntoVenta.list') }}"><i class="fa fa-archive"></i> Punto de venta</a>
         </li>
         <li class="breadcrumb-item"><i class="fa fa-plus-circle"></i> Nueva venta</li>
     </ol>

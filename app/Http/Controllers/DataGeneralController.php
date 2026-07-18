@@ -64,6 +64,7 @@ class DataGeneralController extends Controller
         'tiktok',
 
         'password_reset',
+        'igv_venta'
     ];
 
     public function index()

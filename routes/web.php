@@ -5,6 +5,7 @@ use \App\Http\Controllers\MetaController;
 use \App\Http\Controllers\MaterialDetailSettingController;
 use \App\Http\Controllers\MaterialPresentationController;
 use \App\Http\Controllers\StoreWebController;
+use \App\Http\Controllers\FreeSaleController;
 
 /*
 |--------------------------------------------------------------------------
@@ -3222,6 +3223,20 @@ Route::middleware(['auth', 'check.user.enabled'])->group(function (){
         Route::post('configuracion/usuarios/web/{id}/cambiar-estado', 'ConfigUserWebController@changeStatus')
             ->name('configUserWeb.changeStatus')
             ->middleware('permission:changeStatusUser_configUserWeb');
+
+        Route::prefix('/ventas-libres')->group(function () {
+            Route::get('/', [FreeSaleController::class, 'index'])
+                ->name('freeSale.index');
+
+            Route::get('/crear', [FreeSaleController::class, 'create'])
+                ->name('freeSale.create');
+
+            Route::post('/', [FreeSaleController::class, 'store'])
+                ->name('freeSale.store');
+
+            Route::post('/{sale}/anular', [FreeSaleController::class, 'annul'])
+                ->name('freeSale.annul');
+        });
     });
 });
 

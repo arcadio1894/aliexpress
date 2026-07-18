@@ -54,6 +54,8 @@ class Sale extends Model
 
         'quote_id',
 
+        'free_sale',
+
         'numero',
         'xml_path',
         'cdr_path',
@@ -73,6 +75,10 @@ class Sale extends Model
     ];
 
     protected $dates = ['date_sale'];
+
+    protected $casts = [
+        'free_sale' => 'boolean',
+    ];
 
     public function worker()
     {
