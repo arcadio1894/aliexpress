@@ -71,7 +71,7 @@
             $total  = number_format($detail->total, 2, '.', '');
             $nombre = optional($detail->stockItem)->display_name
                         ?? optional($detail->material)->full_name
-                        ?? 'Producto';
+                        ?? ($detail->description ?: 'Producto');
 
             $hasPresentation = !empty($detail->material_presentation_id)
                 && !empty($detail->packs)

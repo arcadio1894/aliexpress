@@ -8,7 +8,7 @@
     active
 @endsection
 
-@section('activeCreatePuntoVenta')
+@section('activeCreateFreeSale')
     active
 @endsection
 
@@ -638,6 +638,7 @@
                                         max="100"
                                         step="0.01"
                                         value="0"
+                                        readonly
                                 >
 
                                 <div class="input-group-append">
@@ -666,10 +667,11 @@
                                         id="tax_percentage"
                                         name="tax_percentage"
                                         class="form-control"
-                                        min="0"
-                                        max="100"
+                                        min="18"
+                                        max="18"
                                         step="0.01"
                                         value="18"
+                                        readonly
                                 >
 
                                 <div class="input-group-append">
@@ -840,6 +842,13 @@
 
                         <input
                                 type="hidden"
+                                id="taxable_amount"
+                                name="taxable_amount"
+                                value="0.00"
+                        >
+
+                        <input
+                                type="hidden"
                                 id="tax_amount"
                                 name="tax_amount"
                                 value="0.00"
@@ -859,14 +868,41 @@
                                 value="0.00"
                         >
 
-                        <button
-                                type="submit"
-                                id="btnSaveFreeSale"
-                                class="btn btn-primary btn-block"
+                        <div id="wrapSaveFreeSale">
+                            <button
+                                    type="submit"
+                                    id="btnSaveFreeSale"
+                                    class="btn btn-primary btn-block"
+                            >
+                                <i class="fas fa-save mr-1"></i>
+                                Registrar venta libre
+                            </button>
+                        </div>
+
+                        <div
+                                id="wrapFreeSaleResultActions"
+                                style="display: none;"
                         >
-                            <i class="fas fa-save mr-1"></i>
-                            Registrar venta libre
-                        </button>
+                            <a
+                                    href="#"
+                                    id="btnPrintFreeSale"
+                                    class="btn btn-success btn-block"
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                            >
+                                <i class="fas fa-print mr-1"></i>
+                                Imprimir ticket de venta
+                            </a>
+
+                            <button
+                                    type="button"
+                                    id="btnNewFreeSale"
+                                    class="btn btn-outline-primary btn-block"
+                            >
+                                <i class="fas fa-plus-circle mr-1"></i>
+                                Nueva venta
+                            </button>
+                        </div>
 
                     </div>
                 </div>

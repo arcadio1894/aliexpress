@@ -96,20 +96,396 @@ $(document).ready(function () {
     );
 
     $('#formFreeSale').on('submit', function (event) {
+        event.preventDefault();
+
         if (!validarVentaLibre()) {
-            event.preventDefault();
             return;
         }
 
-        /*
-         * Se habilita para que el valor sea incluido en el POST.
-         */
-        $('#tipo_documento_cliente').prop('disabled', false);
+        confirmarRegistroVentaLibre();
+    });
+
+    $('#btnNewFreeSale').on('click', function () {
+        window.location.reload();
+    });
+
+    $('#formFreeSale').on('keydown', 'input, select', function (event) {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            return false;
+        }
     });
 
 
-
 });
+
+function confirmarRegistroVentaLibre() {
+    const partialPaymentsEnabled =
+        $('#pagos_parciales_venta').length > 0 &&
+        $('#pagos_parciales_venta').bootstrapSwitch('state');
+
+    let confirmationContent = '';
+
+    if (partialPaymentsEnabled) {
+        confirmationContent = `
+            <p class="mb-2">
+                ¿Está seguro de registrar esta venta libre con
+                <strong>pagos parciales</strong>?
+            </p>
+
+            <div class="alert alert-warning mb-0">
+                No se registrará un movimiento de caja en este momento.
+                Los pagos serán ingresados posteriormente mediante abonos.
+            </div>
+        `;
+    } else {
+        const $cashBoxOption =
+            $('#pv_cash_box_id option:selected');
+
+        const cashBoxName =
+            $.trim($cashBoxOption.text());
+
+        const cashBoxType =
+            String($cashBoxOption.data('type') || '');
+
+        let paymentDescription = `
+            <p class="mb-2">
+                ¿Está seguro de registrar esta venta libre?
+            </p>
+
+            <div class="alert alert-info mb-0">
+                <div>
+                    <strong>Caja:</strong>
+                    ${escapeHtml(cashBoxName)}
+                </div>
+        `;
+
+        if (
+            cashBoxType === 'bank' &&
+            $('#pv_cash_box_subtype_id').val()
+        ) {
+            const subtypeName = $.trim(
+                $('#pv_cash_box_subtype_id option:selected').text()
+            );
+
+            paymentDescription += `
+                <div>
+                    <strong>Canal:</strong>
+                    ${escapeHtml(subtypeName)}
+                </div>
+            `;
+        }
+
+        paymentDescription += `
+                <div class="mt-2">
+                    <strong>Total:</strong>
+                    ${escapeHtml($('#totalView').text())}
+                </div>
+            </div>
+        `;
+
+        confirmationContent = paymentDescription;
+    }
+
+    $.confirm({
+        title: 'Confirmar venta libre',
+        content: confirmationContent,
+        type: 'blue',
+        columnClass: 'medium',
+        buttons: {
+            confirm: {
+                text: 'Sí, registrar venta',
+                btnClass: 'btn-primary',
+                action: function () {
+                    guardarVentaLibre();
+                }
+            },
+            cancel: {
+                text: 'Cancelar',
+                btnClass: 'btn-default'
+            }
+        }
+    });
+}
+
+function guardarVentaLibre() {
+    const $form = $('#formFreeSale');
+    const $button = $('#btnSaveFreeSale');
+
+    /*
+     * Este select se deshabilita cuando el cliente es registrado.
+     * Lo habilitamos para que su valor sea incluido en FormData.
+     */
+    $('#tipo_documento_cliente').prop('disabled', false);
+
+    const formData = new FormData($form[0]);
+
+    bloquearBotonGuardarVentaLibre(true);
+
+    $.ajax({
+        url: $form.attr('action'),
+        method: 'POST',
+        data: formData,
+        processData: false,
+        contentType: false,
+
+        headers: {
+            'Accept': 'application/json',
+            'X-CSRF-TOKEN': $('meta[name="csrf-token"]').attr('content')
+        },
+
+        success: function (response) {
+            mostrarVentaLibreRegistrada(response);
+        },
+
+        error: function (xhr) {
+            bloquearBotonGuardarVentaLibre(false);
+
+            /*
+             * Restauramos el bloqueo visual cuando corresponde.
+             */
+            if ($('#client_mode').val() === 'registered') {
+                $('#tipo_documento_cliente')
+                    .prop('disabled', true)
+                    .trigger('change.select2');
+            }
+
+            mostrarErroresVentaLibreBackend(xhr);
+        }
+    });
+}
+
+function bloquearBotonGuardarVentaLibre(blocked) {
+    const $button = $('#btnSaveFreeSale');
+
+    $button.prop('disabled', blocked);
+
+    if (blocked) {
+        $button.html(
+            '<i class="fas fa-spinner fa-spin mr-1"></i>' +
+            'Registrando venta...'
+        );
+
+        return;
+    }
+
+    $button.html(
+        '<i class="fas fa-save mr-1"></i>' +
+        'Registrar venta libre'
+    );
+}
+
+function mostrarVentaLibreRegistrada(response) {
+    const printUrl = response.url_print || '#';
+
+    /*
+     * El botón original desaparece definitivamente.
+     */
+    $('#wrapSaveFreeSale').hide();
+
+    /*
+     * Se configura el botón para abrir el ticket en otra pestaña.
+     */
+    $('#btnPrintFreeSale').attr('href', printUrl);
+
+    $('#wrapFreeSaleResultActions').show();
+
+    /*
+     * Bloqueamos el formulario para evitar cambios posteriores
+     * sobre una venta que ya fue registrada.
+     */
+    bloquearFormularioVentaLibre();
+
+    $.alert({
+        title: 'Venta registrada con éxito',
+        content: `
+            <p class="mb-2">
+                La venta libre fue registrada correctamente.
+            </p>
+
+            <div class="alert alert-success mb-0">
+                Código de venta:
+                <strong>#${escapeHtml(String(response.sale_id || ''))}</strong>
+            </div>
+        `,
+        type: 'green',
+        buttons: {
+            ok: {
+                text: 'Aceptar',
+                btnClass: 'btn-success'
+            }
+        }
+    });
+}
+
+function bloquearFormularioVentaLibre() {
+    $('#formFreeSale')
+        .find('input, select, textarea, button')
+        .not(
+            '#btnPrintFreeSale, ' +
+            '#btnNewFreeSale'
+        )
+        .prop('disabled', true);
+
+    /*
+     * Bootstrap Switch necesita su propio bloqueo.
+     */
+    if ($('#pagos_parciales_venta').length > 0) {
+        $('#pagos_parciales_venta')
+            .bootstrapSwitch('disabled', true);
+    }
+}
+
+function mostrarErroresVentaLibreBackend(xhr) {
+    let title = 'No se pudo registrar la venta';
+    let generalMessage =
+        'Corrija los siguientes errores antes de continuar.';
+
+    let errors = [];
+
+    /*
+     * Errores normales del FormRequest: HTTP 422
+     *
+     * {
+     *   message: "The given data was invalid.",
+     *   errors: {
+     *      customer_id: ["Seleccione un cliente..."]
+     *   }
+     * }
+     */
+    if (
+        xhr.responseJSON &&
+        xhr.responseJSON.errors
+    ) {
+        $.each(
+            xhr.responseJSON.errors,
+            function (field, messages) {
+                marcarCampoConErrorBackend(field, messages);
+
+                $.each(messages, function (index, message) {
+                    errors.push(message);
+                });
+            }
+        );
+    }
+
+    /*
+     * Excepciones controladas por el store().
+     */
+    if (
+        errors.length === 0 &&
+        xhr.responseJSON &&
+        xhr.responseJSON.message
+    ) {
+        errors.push(xhr.responseJSON.message);
+    }
+
+    /*
+     * Respuesta no JSON o error inesperado.
+     */
+    if (errors.length === 0) {
+        errors.push(
+            'Ocurrió un error inesperado al registrar la venta.'
+        );
+    }
+
+    const errorList = errors
+        .map(function (message) {
+            return `
+                <li class="mb-1">
+                    ${escapeHtml(String(message))}
+                </li>
+            `;
+        })
+        .join('');
+
+    $.alert({
+        title: title,
+        content: `
+            <p>${generalMessage}</p>
+
+            <div class="alert alert-danger mb-0">
+                <ul class="mb-0 pl-3">
+                    ${errorList}
+                </ul>
+            </div>
+        `,
+        type: 'red',
+        columnClass: 'medium',
+        buttons: {
+            ok: {
+                text: 'Corregir',
+                btnClass: 'btn-danger'
+            }
+        }
+    });
+}
+
+function marcarCampoConErrorBackend(field, messages) {
+    const message = Array.isArray(messages)
+        ? messages[0]
+        : messages;
+
+    /*
+     * Convierte:
+     * items.0.description
+     *
+     * en:
+     * items[0][description]
+     */
+    const fieldName = field.replace(
+        /\.([0-9]+)\.([^.]+)/g,
+        '[$1][$2]'
+    );
+
+    let $field = $('[name="' + fieldName + '"]');
+
+    if ($field.length === 0) {
+        $field = $('[name="' + field + '"]');
+    }
+
+    if ($field.length > 0) {
+        $field.addClass('is-invalid');
+
+        /*
+         * Para Select2 aplicamos el borde al elemento visible.
+         */
+        if ($field.hasClass('select2-hidden-accessible')) {
+            $field
+                .next('.select2-container')
+                .find('.select2-selection')
+                .addClass('border-danger');
+        }
+    }
+
+    const errorContainerId =
+        field.replace(/\./g, '_') + '_error';
+
+    $('#' + errorContainerId).text(message);
+}
+
+function limpiarErroresVentaLibre() {
+    $('.is-invalid').removeClass('is-invalid');
+
+    $('.select2-selection')
+        .removeClass('border-danger');
+
+    $('#customer_id_error').text('');
+
+    $('#cash_box_id_error').text('');
+    $('#cash_box_subtype_id_error').text('');
+
+    $('#amount_received_error').text('');
+
+    $('#change_cash_box_id_error').text('');
+    $('#change_cash_box_subtype_id_error').text('');
+}
+
+function escapeHtml(value) {
+    return $('<div>')
+        .text(value == null ? '' : value)
+        .html();
+}
 
 function actualizarCamposEfectivo() {
     const partialPaymentsEnabled =
@@ -384,14 +760,19 @@ function calcularVentaLibre() {
     const discountAmount =
         subtotal * discountPercentage / 100;
 
-    const taxableAmount =
+    const totalAmount =
         Math.max(subtotal - discountAmount, 0);
 
-    const taxAmount =
-        taxableAmount * taxPercentage / 100;
+    const taxFactor =
+        1 + (taxPercentage / 100);
 
-    const totalAmount =
-        taxableAmount + taxAmount;
+    const taxableAmount =
+        taxPercentage > 0
+            ? totalAmount / taxFactor
+            : totalAmount;
+
+    const taxAmount =
+        totalAmount - taxableAmount;
 
     const $selectedCashBox =
         $('#pv_cash_box_id option:selected');
@@ -413,6 +794,7 @@ function calcularVentaLibre() {
     $('#subtotal').val(subtotal.toFixed(2));
     $('#total_discount').val(discountAmount.toFixed(2));
     $('#tax_amount').val(taxAmount.toFixed(2));
+    $('#taxable_amount').val(taxableAmount.toFixed(2));
     $('#total_amount').val(totalAmount.toFixed(2));
     $('#change_amount').val(changeAmount.toFixed(2));
 
@@ -937,16 +1319,4 @@ function validarVentaLibre() {
     }
 
     return isValid;
-}
-
-function limpiarErroresVentaLibre() {
-    $('.is-invalid').removeClass('is-invalid');
-
-    $('#customer_id_error').text('');
-    $('#cash_box_id_error').text('');
-    $('#cash_box_subtype_id_error').text('');
-
-    $('#amount_received_error').text('');
-    $('#change_cash_box_id_error').text('');
-    $('#change_cash_box_subtype_id_error').text('');
 }
