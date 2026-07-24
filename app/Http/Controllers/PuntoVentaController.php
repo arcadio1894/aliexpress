@@ -2865,14 +2865,14 @@ class PuntoVentaController extends Controller
 
         if ( $startDate == "" || $endDate == "" )
         {
-            $query = Sale::with(['quote.customer', 'worker.user'])
+            $query = Sale::with(['quote.customer', 'worker.user', 'customer'])
                 /*->where('state_annulled', 0)*/
                 ->orderBy('created_at', 'DESC');
         } else {
             $fechaInicio = Carbon::createFromFormat('d/m/Y', $startDate);
             $fechaFinal = Carbon::createFromFormat('d/m/Y', $endDate);
 
-            $query = Sale::with(['quote.customer', 'worker.user'])
+            $query = Sale::with(['quote.customer', 'worker.user', 'customer'])
                 /*->where('state_annulled', 0)*/
                 ->whereDate('created_at', '>=', $fechaInicio)
                 ->whereDate('created_at', '<=', $fechaFinal)
@@ -3079,7 +3079,7 @@ class PuntoVentaController extends Controller
 
             $nombreCliente = 'SIN CLIENTE';
 
-            if ($sale->pagos_parciales_venta === 's') {
+            /*if ($sale->pagos_parciales_venta === 's') {
 
                 if ($sale->quote) {
                     if ($sale->quote->customer) {
@@ -3091,6 +3091,32 @@ class PuntoVentaController extends Controller
                     $nombreCliente = 'VENTA DIRECTA';
                 }
             } else {
+                if ($sale->quote) {
+                    if ($sale->quote->customer) {
+                        $nombreCliente = $sale->quote->customer->business_name;
+                    } else {
+                        $nombreCliente = 'COTIZACION SIN CLIENTE';
+                    }
+                } else {
+                    $nombreCliente = 'VENTA DIRECTA';
+                }
+            }*/
+            if ((bool) $sale->free_sale) {
+                /*
+                 * Venta libre:
+                 * 1. Si tiene customer_id, toma el nombre actual del Customer.
+                 * 2. Si no tiene customer_id, toma el snapshot guardado en Sale.
+                 * 3. Si no existe ninguno, muestra SIN CLIENTE.
+                 */
+                if ($sale->customer) {
+                    $nombreCliente = $sale->customer->business_name;
+                } elseif (!empty(trim((string) $sale->nombre_cliente))) {
+                    $nombreCliente = $sale->nombre_cliente;
+                }
+            } else {
+                /*
+                 * Ventas normales existentes.
+                 */
                 if ($sale->quote) {
                     if ($sale->quote->customer) {
                         $nombreCliente = $sale->quote->customer->business_name;
@@ -3211,6 +3237,8 @@ class PuntoVentaController extends Controller
 
             array_push($arraySales, [
                 "id" => $sale->id,
+                "free_sale" => (bool) $sale->free_sale,
+                "customer_id" => $sale->customer_id,
                 "code" => "VENTA - ".$sale->id,
                 "date" => ($sale->date_sale != null) ? $sale->formatted_sale_date : "",
                 "currency" => ($sale->currency == 'PEN') ? 'Soles' : 'Dólares',

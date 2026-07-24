@@ -438,12 +438,28 @@ $(document).ready(function () {
         });
     });
 
-    $(document).on('click', '[data-generar_comprobante]', function () {
+    /*$(document).on('click', '[data-generar_comprobante]', function () {
         let saleId = $(this).data('sale_id');
 
         limpiarModalGenerarComprobante();
 
         $('#gc_sale_id').val(saleId);
+        $('#modalGenerarComprobante').modal('show');
+    });*/
+
+    $(document).on('click', '[data-generar_comprobante]', function (event) {
+        event.preventDefault();
+
+        const saleId = $(this).data('sale_id');
+
+        const isFreeSale = String( $(this).data('free_sale') ) === '1';
+
+        limpiarModalGenerarComprobante();
+
+        $('#gc_sale_id').val(saleId);
+
+        $('#gc_free_sale').val( isFreeSale ? '1' : '0');
+
         $('#modalGenerarComprobante').modal('show');
     });
 
@@ -458,7 +474,7 @@ $(document).ready(function () {
         $('#gc_email_factura').val('');
     });
 
-    $('#gc_dni').on('keydown', function (e) {
+    /*$('#gc_dni').on('keydown', function (e) {
         if (e.key !== 'Enter') return;
 
         e.preventDefault();
@@ -486,9 +502,48 @@ $(document).ready(function () {
         }
 
         consultarClienteComprobante(ruc, 'ruc');
-    });
+    });*/
+    $('#gc_dni').on(
+        'keydown',
+        function (event) {
+            if (event.key !== 'Enter') {
+                return;
+            }
 
-    $('#btnConfirmarGenerarComprobante').on('click', function () {
+            event.preventDefault();
+
+            buscarDniGenerarComprobante();
+        }
+    );
+
+    $('#btnBuscarGcDni').on(
+        'click',
+        function () {
+            buscarDniGenerarComprobante();
+        }
+    );
+
+    $('#gc_ruc').on(
+        'keydown',
+        function (event) {
+            if (event.key !== 'Enter') {
+                return;
+            }
+
+            event.preventDefault();
+
+            buscarRucGenerarComprobante();
+        }
+    );
+
+    $('#btnBuscarGcRuc').on(
+        'click',
+        function () {
+            buscarRucGenerarComprobante();
+        }
+    );
+
+    /*$('#btnConfirmarGenerarComprobante').on('click', function () {
         let saleId = $('#gc_sale_id').val();
 
         let activeTab = $('#gc_tabs .nav-link.active').attr('href');
@@ -547,7 +602,7 @@ $(document).ready(function () {
                                             text: 'Ver PDF',
                                             btnClass: 'btn-primary',
                                             action: function () {
-                                                /*if (res.url_print) {
+                                                /!*if (res.url_print) {
                                                     window.open(res.url_print, '_blank');
                                                 }
 
@@ -557,7 +612,7 @@ $(document).ready(function () {
                                                     getData();
                                                 } else {
                                                     location.reload();
-                                                }*/
+                                                }*!/
                                                 finalizarGeneracionComprobante(res, true);
                                             }
                                         },
@@ -565,13 +620,13 @@ $(document).ready(function () {
                                             text: 'Cerrar',
                                             btnClass: 'btn-secondary',
                                             action: function () {
-                                                /*$('#modalGenerarComprobante').modal('hide');
+                                                /!*$('#modalGenerarComprobante').modal('hide');
 
                                                 if (typeof getData === 'function') {
                                                     getData();
                                                 } else {
                                                     location.reload();
-                                                }*/
+                                                }*!/
                                                 finalizarGeneracionComprobante(res, false);
                                             }
                                         }
@@ -605,7 +660,157 @@ $(document).ready(function () {
                 }
             }
         });
-    });
+    });*/
+
+    $('#btnConfirmarGenerarComprobante').on(
+        'click',
+        function () {
+            const saleId =
+                $('#gc_sale_id').val();
+
+            const isFreeSale =
+                $('#gc_free_sale').val() === '1';
+
+            const activeTab =
+                $('#gc_tabs .nav-link.active')
+                    .attr('href');
+
+            const tipoComprobante =
+                activeTab === '#gc_factura'
+                    ? 'factura'
+                    : 'boleta';
+
+            const payload = {
+                sale_id: saleId,
+                tipo_comprobante:
+                tipoComprobante,
+
+                dni: $('#gc_dni').val(),
+                name: $('#gc_name').val(),
+                email_boleta:
+                    $('#gc_email_boleta').val(),
+
+                ruc: $('#gc_ruc').val(),
+                razon_social:
+                    $('#gc_razon_social').val(),
+                direccion_fiscal:
+                    $('#gc_direccion_fiscal').val(),
+                email_factura:
+                    $('#gc_email_factura').val()
+            };
+
+            if (
+                !validarDatosGenerarComprobante(
+                    tipoComprobante
+                )
+            ) {
+                return;
+            }
+
+            const url = isFreeSale
+                ? '/dashboard/free-sale/generate-invoice'
+                : '/dashboard/sale/generate-invoice';
+
+            const tipoVentaText = isFreeSale
+                ? 'venta libre'
+                : 'venta';
+
+            $.confirm({
+                title: 'Confirmar comprobante',
+
+                content: `
+                ¿Está seguro de generar el comprobante
+                electrónico para esta
+                <strong>${tipoVentaText}</strong>?
+                <br><br>
+                <strong>Venta #${saleId}</strong>
+            `,
+
+                type: 'orange',
+
+                buttons: {
+                    confirmar: {
+                        text: 'Sí, generar',
+                        btnClass: 'btn-warning',
+
+                        action: function () {
+                            const dialog = this;
+
+                            dialog.buttons
+                                .confirmar
+                                .disable();
+
+                            dialog.buttons
+                                .cancelar
+                                .disable();
+
+                            dialog.setContent(`
+                            <div style="
+                                display:flex;
+                                align-items:center;
+                                gap:10px;
+                            ">
+                                <i class="
+                                    fa fa-spinner
+                                    fa-spin
+                                "></i>
+
+                                <span>
+                                    Generando comprobante
+                                    electrónico...
+                                </span>
+                            </div>
+                        `);
+
+                            $.ajax({
+                                url: url,
+                                method: 'POST',
+                                data: payload,
+
+                                headers: {
+                                    'Accept':
+                                        'application/json',
+
+                                    'X-CSRF-TOKEN':
+                                        $('meta[name="csrf-token"]')
+                                            .attr('content')
+                                },
+
+                                success: function (response) {
+                                    dialog.close();
+
+                                    mostrarExitoGeneracionComprobante(
+                                        response
+                                    );
+                                },
+
+                                error: function (xhr) {
+                                    dialog.buttons
+                                        .confirmar
+                                        .enable();
+
+                                    dialog.buttons
+                                        .cancelar
+                                        .enable();
+
+                                    mostrarErrorGeneracionComprobante(
+                                        xhr
+                                    );
+                                }
+                            });
+
+                            return false;
+                        }
+                    },
+
+                    cancelar: {
+                        text: 'Cancelar',
+                        btnClass: 'btn-secondary'
+                    }
+                }
+            });
+        }
+    );
 
     $(document).on('switchChange.bootstrapSwitch', '.switch-dispatch-status', function (event, state) {
         let $switch = $(this);
@@ -667,7 +872,7 @@ $(document).ready(function () {
         }
     });
 
-    $(document).on('click', '[data-consultar_anulacion]', function () {
+    /*$(document).on('click', '[data-consultar_anulacion]', function () {
         let saleId = $(this).data('sale_id');
 
         showProcessLoader('Estamos consultando el comprobante a SUNAT...');
@@ -718,7 +923,98 @@ $(document).ready(function () {
                 hideProcessLoader();
             }
         });
-    });
+    });*/
+    $(document).on('click', '[data-consultar_anulacion]', function () {
+            const saleId =
+                $(this).data('sale_id');
+
+            const isFreeSale =
+                String(
+                    $(this).data('free_sale')
+                ) === '1';
+
+            const url = isFreeSale
+                ? '/dashboard/ventas-libres/' +
+                saleId +
+                '/consultar-anulacion'
+                : '/dashboard/consultar/anulacion/' +
+                saleId;
+
+            $.ajax({
+                url: url,
+                method: 'POST',
+
+                headers: {
+                    'Accept': 'application/json',
+                    'X-CSRF-TOKEN':
+                        $('meta[name="csrf-token"]')
+                            .attr('content')
+                },
+
+                processData: false,
+                contentType: false,
+
+                success: function (data) {
+                    $.alert({
+                        title:
+                            'Consulta realizada',
+
+                        content:
+                        data.message,
+
+                        type:
+                            data.pending_annulment
+                                ? 'orange'
+                                : 'green',
+
+                        buttons: {
+                            ok: {
+                                text: 'Aceptar',
+                                btnClass:
+                                    data.pending_annulment
+                                        ? 'btn-warning'
+                                        : 'btn-success',
+
+                                action: function () {
+                                    reloadCurrentPageOrders();
+                                }
+                            }
+                        }
+                    });
+                },
+
+                error: function (xhr) {
+                    let message =
+                        'Sucedió un error al consultar la anulación.';
+
+                    if (
+                        xhr.responseJSON &&
+                        xhr.responseJSON.message
+                    ) {
+                        message =
+                            xhr.responseJSON.message;
+                    }
+
+                    $.alert({
+                        title: 'Aviso',
+                        content: message,
+                        type: 'orange',
+
+                        buttons: {
+                            ok: {
+                                text: 'Entendido',
+                                btnClass: 'btn-warning',
+
+                                action: function () {
+                                    reloadCurrentPageOrders();
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    );
 
     $(document).on('click', '[data-generar_nota_credito]', function () {
         let saleId = $(this).data('sale_id');
@@ -1234,6 +1530,220 @@ var $permissions;
 
 let ncPartialData = null;
 let ncPartialSelectedItems = {};
+
+function validarDatosGenerarComprobante(
+    tipoComprobante
+) {
+    if (tipoComprobante === 'boleta') {
+        const dni =
+            $('#gc_dni').val().trim();
+
+        const name =
+            $('#gc_name').val().trim();
+
+        if (!/^\d{8}$/.test(dni)) {
+            toastr.warning(
+                'Ingrese un DNI válido de 8 dígitos.'
+            );
+
+            $('#gc_dni').focus();
+            return false;
+        }
+
+        if (!name) {
+            toastr.warning(
+                'Busque el DNI para obtener el nombre.'
+            );
+
+            $('#gc_dni').focus();
+            return false;
+        }
+
+        return true;
+    }
+
+    const ruc =
+        $('#gc_ruc').val().trim();
+
+    const businessName =
+        $('#gc_razon_social').val().trim();
+
+    const fiscalAddress =
+        $('#gc_direccion_fiscal').val().trim();
+
+    if (!/^\d{11}$/.test(ruc)) {
+        toastr.warning(
+            'Ingrese un RUC válido de 11 dígitos.'
+        );
+
+        $('#gc_ruc').focus();
+        return false;
+    }
+
+    if (!businessName || !fiscalAddress) {
+        toastr.warning(
+            'Busque el RUC para obtener la razón social y dirección fiscal.'
+        );
+
+        $('#gc_ruc').focus();
+        return false;
+    }
+
+    return true;
+}
+
+function mostrarExitoGeneracionComprobante(
+    response
+) {
+    $.alert({
+        title: 'Comprobante generado',
+
+        content:
+            response.message ||
+            'Comprobante generado correctamente.',
+
+        type: 'green',
+
+        buttons: {
+            ver: {
+                text: 'Ver PDF',
+                btnClass: 'btn-primary',
+
+                action: function () {
+                    finalizarGeneracionComprobante(
+                        response,
+                        true
+                    );
+                }
+            },
+
+            cerrar: {
+                text: 'Cerrar',
+                btnClass: 'btn-secondary',
+
+                action: function () {
+                    finalizarGeneracionComprobante(
+                        response,
+                        false
+                    );
+                }
+            }
+        }
+    });
+}
+
+function mostrarErrorGeneracionComprobante(xhr) {
+    let messages = [];
+
+    if (
+        xhr.responseJSON &&
+        xhr.responseJSON.errors
+    ) {
+        $.each(
+            xhr.responseJSON.errors,
+            function (field, fieldMessages) {
+                $.each(
+                    fieldMessages,
+                    function (index, message) {
+                        messages.push(message);
+                    }
+                );
+            }
+        );
+    }
+
+    if (
+        messages.length === 0 &&
+        xhr.responseJSON &&
+        xhr.responseJSON.message
+    ) {
+        messages.push(
+            xhr.responseJSON.message
+        );
+    }
+
+    if (messages.length === 0) {
+        messages.push(
+            'No se pudo generar el comprobante.'
+        );
+    }
+
+    const html = messages
+        .map(function (message) {
+            return `
+                <li class="mb-1">
+                    ${escapeHtml(message)}
+                </li>
+            `;
+        })
+        .join('');
+
+    $.alert({
+        title:
+            'Error al generar comprobante',
+
+        content: `
+            <p>
+                Revise la siguiente información:
+            </p>
+
+            <div class="
+                alert alert-danger mb-0
+            ">
+                <ul class="mb-0 pl-3">
+                    ${html}
+                </ul>
+            </div>
+        `,
+
+        type: 'red',
+
+        buttons: {
+            ok: {
+                text: 'Aceptar',
+                btnClass: 'btn-danger'
+            }
+        }
+    });
+}
+
+function buscarDniGenerarComprobante() {
+    const dni =
+        $('#gc_dni').val().trim();
+
+    if (!/^\d{8}$/.test(dni)) {
+        toastr.warning(
+            'Ingrese un DNI válido de 8 dígitos.'
+        );
+
+        $('#gc_dni').focus();
+        return;
+    }
+
+    consultarClienteComprobante(
+        dni,
+        'dni'
+    );
+}
+
+function buscarRucGenerarComprobante() {
+    const ruc =
+        $('#gc_ruc').val().trim();
+
+    if (!/^\d{11}$/.test(ruc)) {
+        toastr.warning(
+            'Ingrese un RUC válido de 11 dígitos.'
+        );
+
+        $('#gc_ruc').focus();
+        return;
+    }
+
+    consultarClienteComprobante(
+        ruc,
+        'ruc'
+    );
+}
 
 function prepararEnvioNotaCreditoParcial() {
     let saleId = $('#nc_partial_sale_id').val();
@@ -1847,7 +2357,7 @@ function cargarPagosParciales(saleId) {
     });
 }
 
-function anularOrder() {
+function anularOrderO() {
     var order_id = $(this).data('id');
     var typeDocument = $(this).data('type_document');
 
@@ -1929,6 +2439,197 @@ function anularOrder() {
         },
     });
 
+}
+
+function anularOrder() {
+    const saleId = $(this).data('id');
+
+    const typeDocument = String(
+        $(this).data('type_document') || ''
+    );
+
+    const isFreeSale =
+        String($(this).data('free_sale')) === '1';
+
+    const hasElectronicDocument =
+        typeDocument === '01' ||
+        typeDocument === '03';
+
+    const url = isFreeSale
+        ? '/dashboard/ventas-libres/' +
+        saleId +
+        '/anular'
+        : '/dashboard/anular/order/' +
+        saleId;
+
+    let title;
+    let content;
+
+    if (isFreeSale) {
+        if (hasElectronicDocument) {
+            title =
+                '¿Está seguro de anular esta ' +
+                '<strong>venta libre facturada</strong>?';
+
+            content = `
+                Esta venta posee una boleta o factura electrónica.
+                Se aplicará el procedimiento correspondiente con
+                Nubefact/SUNAT y se revertirán sus movimientos
+                financieros.
+                <br><br>
+                Los pagos parciales existentes serán inactivados,
+                pero se conservará su historial.
+                <br><br>
+                <strong>VENTA ${saleId}</strong>
+            `;
+        } else {
+            title =
+                '¿Está seguro de anular esta ' +
+                '<strong>venta libre</strong>?';
+
+            content = `
+                Se revertirán todos los movimientos financieros
+                asociados a esta venta.
+                <br><br>
+                Los pagos parciales quedarán inactivos, pero
+                conservarán su historial.
+                <br><br>
+                Esta operación no afectará inventario.
+                <br><br>
+                <strong>VENTA ${saleId}</strong>
+            `;
+        }
+    } else if (hasElectronicDocument) {
+        title =
+            '¿Está seguro de dar de baja esta ' +
+            '<strong>boleta/factura</strong>?';
+
+        content = `
+            Esta acción afectará el comprobante registrado
+            y realizará la comunicación correspondiente
+            con SUNAT.
+            <br><br>
+            Verifique la información antes de continuar,
+            ya que el proceso podría no ser reversible.
+            <br><br>
+            <strong>ORDEN ${saleId}</strong>
+        `;
+    } else {
+        title =
+            '¿Está seguro de anular esta orden?';
+
+        content = `
+            Verifique la información antes de continuar.
+            <br><br>
+            <strong>ORDEN ${saleId}</strong>
+        `;
+    }
+
+    $.confirm({
+        icon: 'fas fa-trash-alt',
+        theme: 'modern',
+        closeIcon: true,
+        animation: 'zoom',
+        type: 'red',
+        title: title,
+        content: content,
+
+        buttons: {
+            confirm: {
+                text: 'CONFIRMAR',
+                btnClass: 'btn-danger',
+
+                action: function () {
+                    ejecutarAnulacionVenta(
+                        url
+                    );
+                }
+            },
+
+            cancel: {
+                text: 'CANCELAR',
+                btnClass: 'btn-default'
+            }
+        }
+    });
+}
+
+function ejecutarAnulacionVenta(url) {
+    $.ajax({
+        url: url,
+        method: 'POST',
+
+        headers: {
+            'Accept': 'application/json',
+            'X-CSRF-TOKEN':
+                $('meta[name="csrf-token"]')
+                    .attr('content')
+        },
+
+        processData: false,
+        contentType: false,
+
+        success: function (data) {
+            const isPending =
+                data.pending_annulment === true;
+
+            $.alert({
+                title: isPending
+                    ? 'Anulación pendiente'
+                    : 'Venta anulada',
+
+                content: data.message,
+
+                type: isPending
+                    ? 'orange'
+                    : 'green',
+
+                buttons: {
+                    ok: {
+                        text: 'Aceptar',
+
+                        btnClass: isPending
+                            ? 'btn-warning'
+                            : 'btn-success',
+
+                        action: function () {
+                            reloadCurrentPageOrders();
+                        }
+                    }
+                }
+            });
+        },
+
+        error: function (xhr) {
+            let message =
+                'Sucedió un error al anular la venta.';
+
+            if (
+                xhr.responseJSON &&
+                xhr.responseJSON.message
+            ) {
+                message =
+                    xhr.responseJSON.message;
+            }
+
+            $.alert({
+                title: 'No se pudo completar la anulación',
+                content: message,
+                type: 'orange',
+
+                buttons: {
+                    ok: {
+                        text: 'Entendido',
+                        btnClass: 'btn-warning',
+
+                        action: function () {
+                            reloadCurrentPageOrders();
+                        }
+                    }
+                }
+            });
+        }
+    });
 }
 
 function printOrder() {
@@ -2470,7 +3171,7 @@ function renderDataTable(data) {
         printBtn.setAttribute('target', '_blank');
     }
 
-    const btnAnular = cloneBtnActive.querySelector("[data-anular]");
+    /*const btnAnular = cloneBtnActive.querySelector("[data-anular]");
 
     if (
         data.annulment_status === 'pending' ||
@@ -2481,15 +3182,41 @@ function renderDataTable(data) {
     } else {
         btnAnular.setAttribute("data-id", data.id);
         btnAnular.setAttribute("data-type_document", data.type_document);
+    }*/
+    const btnAnular =
+        cloneBtnActive.querySelector("[data-anular]");
+
+    if (
+        data.annulment_status === 'pending' ||
+        data.annulment_status === 'waiting_sunat_process' ||
+        data.annulment_status === 'accepted'
+    ) {
+        btnAnular.remove();
+    } else {
+        btnAnular.setAttribute('data-id',data.id);
+
+        btnAnular.setAttribute('data-type_document',data.type_document || '');
+
+        btnAnular.setAttribute('data-free_sale',data.free_sale ? '1' : '0');
     }
 
-    const btnConsultarAnulacion = cloneBtnActive.querySelector("[data-consultar_anulacion]");
+    /*const btnConsultarAnulacion = cloneBtnActive.querySelector("[data-consultar_anulacion]");
 
     if (
         data.annulment_status === 'pending' ||
         data.annulment_status === 'waiting_sunat_process'
     ) {
         btnConsultarAnulacion.setAttribute("data-sale_id", data.id);
+    } else {
+        btnConsultarAnulacion.remove();
+    }*/
+    const btnConsultarAnulacion =
+        cloneBtnActive.querySelector("[data-consultar_anulacion]");
+
+    if (data.annulment_status === 'pending' || data.annulment_status === 'waiting_sunat_process') {
+        btnConsultarAnulacion.setAttribute('data-sale_id',data.id);
+
+        btnConsultarAnulacion.setAttribute('data-free_sale',data.free_sale ? '1' : '0');
     } else {
         btnConsultarAnulacion.remove();
     }
@@ -2548,7 +3275,7 @@ function renderDataTable(data) {
         btnConsultarNotaCredito.remove();
     }
 
-    const tieneComprobanteValido =
+    /*const tieneComprobanteValido =
         (data.type_document === '01' || data.type_document === '03') &&
         data.sunat_status !== 'Error';
 
@@ -2557,6 +3284,22 @@ function renderDataTable(data) {
     } else {
         btnGenerarComprobante.setAttribute("data-sale_id", data.id);
         btnGenerarComprobante.setAttribute("href", "#");
+    }*/
+    const tieneComprobanteValido =
+        (
+            data.type_document === '01' ||
+            data.type_document === '03'
+        ) &&
+        data.sunat_status !== 'Error';
+
+    if (tieneComprobanteValido) {
+        btnGenerarComprobante.remove();
+    } else {
+        btnGenerarComprobante.setAttribute('data-sale_id',data.id);
+
+        btnGenerarComprobante.setAttribute('data-free_sale',data.free_sale ? '1' : '0');
+
+        btnGenerarComprobante.setAttribute('href','#');
     }
 
     if (data.pagos_parciales_venta === 's') {

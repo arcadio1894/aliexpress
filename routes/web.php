@@ -3236,6 +3236,16 @@ Route::middleware(['auth', 'check.user.enabled'])->group(function (){
 
             Route::post('/{sale}/anular', [FreeSaleController::class, 'annul'])
                 ->name('freeSale.annul');
+
+            Route::post(
+                '/{sale}/consultar-anulacion',
+                'FreeSaleController@consultAnnulment'
+            )->name('freeSale.consultAnnulment');
+
+            Route::post(
+                '/generate-invoice',
+                'FreeSaleController@generateInvoice'
+            )->name('freeSale.generateInvoice');
         });
     });
 });

@@ -8,6 +8,7 @@ use App\CashMovement;
 use App\CashRegister;
 use App\Customer;
 use App\DataGeneral;
+use App\Http\Controllers\Traits\NubefactTrait;
 use App\Http\Requests\StoreFreeSaleRequest;
 use App\Sale;
 use App\SaleDetail;
@@ -16,9 +17,13 @@ use Carbon\Carbon;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
+use App\SalePartialPayment;
 
 class FreeSaleController extends Controller
 {
+
+    use NubefactTrait;
+
     public function __construct()
     {
         $this->middleware('auth');
@@ -27,10 +32,14 @@ class FreeSaleController extends Controller
             ->only(['index']);*/
 
         $this->middleware('permission:createFreeSale_puntoVenta')
-            ->only(['create', 'store']);
+            ->only(['create', 'store', 'generateInvoice']);
 
-        $this->middleware('permission:anularFreeSale_puntoVenta')
-            ->only(['annul']);
+        $this->middleware(
+            'permission:anularFreeSale_puntoVenta'
+        )->only([
+            'annul',
+            'consultAnnulment',
+        ]);
     }
 
     /**
@@ -372,9 +381,7 @@ class FreeSaleController extends Controller
         }
     }
 
-    private function resolveFreeSaleCustomer(
-        StoreFreeSaleRequest $request
-    ) {
+    private function resolveFreeSaleCustomer(StoreFreeSaleRequest $request) {
         $clientMode = $request->input('client_mode');
 
         if ($clientMode === 'registered') {
@@ -487,10 +494,7 @@ class FreeSaleController extends Controller
         ];
     }
 
-    private function calculateFreeSaleItems(
-        array $items,
-        $taxPercentage
-    ) {
+    private function calculateFreeSaleItems(array $items,$taxPercentage) {
         $scale = 10;
 
         $taxRate = bcdiv(
@@ -657,11 +661,7 @@ class FreeSaleController extends Controller
         ];
     }
 
-    private function resolveFreeSalePayment(
-        StoreFreeSaleRequest $request,
-        $totalAmount,
-        $partialPayments
-    ) {
+    private function resolveFreeSalePayment(StoreFreeSaleRequest $request,$totalAmount,$partialPayments) {
         if ($partialPayments) {
             return [
                 'partial_payments' => true,
@@ -915,10 +915,7 @@ class FreeSaleController extends Controller
         ];
     }
 
-    private function createFreeSaleCashMovements(
-        Sale $sale,
-        array $paymentData
-    ) {
+    private function createFreeSaleCashMovements(Sale $sale,array $paymentData) {
         /** @var CashRegister $cashRegister */
         $cashRegister =
             $paymentData['cash_register'];
@@ -1067,10 +1064,7 @@ class FreeSaleController extends Controller
         );
     }
 
-    private function roundFreeSaleDecimal(
-        $value,
-        $precision = 2
-    ) {
+    private function roundFreeSaleDecimal($value,$precision = 2) {
         $increment = '0.'
             . str_repeat('0', $precision)
             . '5';
@@ -1090,9 +1084,7 @@ class FreeSaleController extends Controller
         );
     }
 
-    private function generateFreeSaleSerie(
-        $requestedSerie = null
-    ) {
+    private function generateFreeSaleSerie($requestedSerie = null) {
         $requestedSerie = trim(
             (string) $requestedSerie
         );
@@ -1118,8 +1110,724 @@ class FreeSaleController extends Controller
     /**
      * Anular una venta libre.
      */
-    public function annul($saleId)
+    public function annul($id)
     {
-        // Se implementará en una etapa posterior.
+        DB::beginTransaction();
+
+        try {
+            $sale = Sale::query()
+                ->with([
+                    'cashMovements.cashRegister.cashBox',
+                    'partialPayments.cashMovement.cashRegister.cashBox',
+                ])
+                ->where('free_sale', true)
+                ->lockForUpdate()
+                ->find($id);
+
+            if (!$sale) {
+                return response()->json([
+                    'message' => 'La venta libre no fue encontrada.',
+                ], 422);
+            }
+
+            if ((int) $sale->state_annulled === 1) {
+                return response()->json([
+                    'message' => 'La venta libre ya fue anulada previamente.',
+                ], 422);
+            }
+
+            if (
+            in_array(
+                $sale->annulment_status,
+                ['pending', 'waiting_sunat_process'],
+                true
+            )
+            ) {
+                return response()->json([
+                    'message' =>
+                        'Esta venta libre ya tiene una anulación pendiente. Consulte su estado antes de intentar nuevamente.',
+
+                    'annulment_status' =>
+                        $sale->annulment_status,
+
+                    'pending_annulment' => true,
+                ], 422);
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | 1. VENTA LIBRE SIN COMPROBANTE ELECTRÓNICO
+            |--------------------------------------------------------------------------
+            */
+            if ($sale->hasNoElectronicDocument()) {
+                $this->setFreeSaleAnnulmentRequestData(
+                    $sale,
+                    'Anulación interna de venta libre sin comprobante electrónico',
+                    'internal'
+                );
+
+                $this->reverseFreeSaleFinancially(
+                    $sale,
+                    'Anulación interna de venta libre sin comprobante electrónico'
+                );
+
+                $this->markFreeSaleAnnulmentAccepted(
+                    $sale,
+                    'internal'
+                );
+
+                DB::commit();
+
+                return response()->json([
+                    'message' =>
+                        'La venta libre fue anulada correctamente.',
+
+                    'annulment_status' => 'accepted',
+                    'pending_annulment' => false,
+
+                    'internal_reversal_status' =>
+                        'reversed',
+                ], 200);
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | 2. COMPROBANTE CON ERROR SUNAT
+            |--------------------------------------------------------------------------
+            */
+            if ($sale->hasSunatError()) {
+                $this->setFreeSaleAnnulmentRequestData(
+                    $sale,
+                    'Anulación interna de venta libre con comprobante en Error SUNAT',
+                    'internal'
+                );
+
+                $this->reverseFreeSaleFinancially(
+                    $sale,
+                    'Anulación de venta libre con comprobante en Error SUNAT'
+                );
+
+                $this->markFreeSaleAnnulmentAccepted(
+                    $sale,
+                    'internal'
+                );
+
+                DB::commit();
+
+                return response()->json([
+                    'message' =>
+                        'La venta libre fue anulada internamente. El comprobante tenía estado Error SUNAT.',
+
+                    'annulment_status' => 'accepted',
+                    'pending_annulment' => false,
+
+                    'internal_reversal_status' =>
+                        'reversed',
+                ], 200);
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | 3. BOLETA EMITIDA HOY
+            |--------------------------------------------------------------------------
+            */
+            if ($sale->isReceiptFromToday()) {
+                $sale->annulment_status =
+                    'waiting_sunat_process';
+
+                $sale->annulment_type =
+                    'nubefact_baja';
+
+                $sale->annulment_reason =
+                    'Boleta emitida hoy. Esperando procesamiento de Nubefact/SUNAT.';
+
+                $sale->annulment_requested_at = now();
+                $sale->annulment_requested_by = Auth::id();
+                $sale->save();
+
+                /*
+                 * Mantenemos el mismo criterio de la venta normal:
+                 * reversión financiera inmediata, aunque SUNAT siga pendiente.
+                 */
+                $this->reverseFreeSaleFinancially(
+                    $sale,
+                    'Boleta emitida hoy. Reversión financiera anticipada.'
+                );
+
+                DB::commit();
+
+                return response()->json([
+                    'message' =>
+                        'La boleta fue emitida hoy. La reversión financiera fue aplicada, pero Nubefact podrá procesar la baja posteriormente.',
+
+                    'annulment_status' =>
+                        'waiting_sunat_process',
+
+                    'waiting_sunat_process' => true,
+                    'pending_annulment' => true,
+
+                    'internal_reversal_status' =>
+                        'reversed',
+                ], 422);
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | 4. COMPROBANTE FUERA DEL PLAZO DE BAJA
+            |--------------------------------------------------------------------------
+            |
+            | Todavía no revertimos financieramente porque la nota de crédito
+            | aún no ha sido generada ni aceptada.
+            */
+            if (!$sale->isWithinAnnulmentDeadline()) {
+                $sale->annulment_status =
+                    'requires_credit_note';
+
+                $sale->annulment_type =
+                    'credit_note';
+
+                $sale->annulment_reason =
+                    'Comprobante fuera de plazo para baja. Requiere Nota de Crédito.';
+
+                $sale->annulment_requested_at = now();
+                $sale->annulment_requested_by = Auth::id();
+                $sale->save();
+
+                DB::commit();
+
+                return response()->json([
+                    'message' =>
+                        'El comprobante ya no puede anularse mediante una baja. Debe generar una Nota de Crédito.',
+
+                    'annulment_status' =>
+                        'requires_credit_note',
+
+                    'requires_credit_note' => true,
+                    'pending_annulment' => false,
+
+                    'internal_reversal_status' =>
+                        $sale->internal_reversal_status,
+                ], 422);
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | 5. COMPROBANTE VÁLIDO DENTRO DEL PLAZO
+            |--------------------------------------------------------------------------
+            */
+            $reason =
+                'Anulación de comprobante de venta libre solicitada por el usuario';
+
+            $sale->annulment_status = 'pending';
+            $sale->annulment_type = 'nubefact_baja';
+            $sale->annulment_reason = $reason;
+            $sale->annulment_requested_at = now();
+            $sale->annulment_requested_by = Auth::id();
+            $sale->save();
+
+            $result = $this->anularComprobanteNubefact(
+                $sale,
+                $reason
+            );
+
+            $this->persistNubefactAnnulmentResult(
+                $sale,
+                $result,
+                $reason
+            );
+
+            $sale->refresh();
+
+            /*
+             * Aplicamos la reversión financiera una sola vez,
+             * aunque SUNAT quede pendiente.
+             */
+            if (
+                $sale->internal_reversal_status !==
+                'reversed'
+            ) {
+                $this->reverseFreeSaleFinancially(
+                    $sale,
+                    'Anulación de venta libre enviada a Nubefact'
+                );
+
+                $sale->refresh();
+            }
+
+            /*
+             * El Trait establece accepted, pending o rejected.
+             */
+            if ($sale->annulment_status === 'accepted') {
+                $sale->state_annulled = 1;
+                $sale->annulled_by = Auth::id();
+
+                $sale->annulment_accepted_at =
+                    $sale->annulment_accepted_at ?: now();
+
+                $sale->save();
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'message' =>
+                    $sale->annulment_status === 'accepted'
+                        ? 'La venta libre y su comprobante fueron anulados correctamente.'
+                        : 'La anulación fue enviada a Nubefact y la reversión financiera fue aplicada. La confirmación de SUNAT puede quedar pendiente.',
+
+                'annulment_status' =>
+                    $sale->annulment_status,
+
+                'pending_annulment' => in_array(
+                    $sale->annulment_status,
+                    ['pending', 'waiting_sunat_process'],
+                    true
+                ),
+
+                'internal_reversal_status' =>
+                    $sale->internal_reversal_status,
+            ], 200);
+
+        } catch (\Throwable $e) {
+            DB::rollBack();
+
+            report($e);
+
+            return response()->json([
+                'message' =>
+                    'No se pudo anular la venta libre: ' .
+                    $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    private function reverseFreeSaleFinancially(
+        Sale $sale,
+        string $reason
+    ) {
+        /*
+         * Idempotencia a nivel de Sale.
+         */
+        if (
+            $sale->internal_reversal_status ===
+            'reversed'
+        ) {
+            return;
+        }
+
+        /*
+         * Obtenemos todos los movimientos directamente relacionados
+         * con la venta:
+         *
+         * - pago normal
+         * - vuelto
+         * - pagos parciales
+         */
+        $movements = CashMovement::query()
+            ->with([
+                'cashRegister.cashBox',
+                'regularizedChildren.cashRegister.cashBox',
+            ])
+            ->where('sale_id', $sale->id)
+            ->lockForUpdate()
+            ->get();
+
+        /*
+         * En caso de que algún pago parcial conserve un movimiento
+         * cuyo sale_id no estuviera poblado, también lo incorporamos
+         * mediante cash_movement_id.
+         */
+        $partialPayments = SalePartialPayment::query()
+            ->with([
+                'cashMovement.cashRegister.cashBox',
+            ])
+            ->where('sale_id', $sale->id)
+            ->where('state', 1)
+            ->lockForUpdate()
+            ->get();
+
+        foreach ($partialPayments as $partialPayment) {
+            if (
+                $partialPayment->cashMovement &&
+                !$movements->contains(
+                    'id',
+                    $partialPayment->cashMovement->id
+                )
+            ) {
+                $movements->push(
+                    $partialPayment->cashMovement
+                );
+            }
+        }
+
+        /*
+         * Incluimos posibles movimientos hijos generados al
+         * regularizar un movimiento bancario diferido.
+         */
+        $additionalMovements = collect();
+
+        foreach ($movements as $movement) {
+            foreach (
+                $movement->regularizedChildren
+                as $regularizedChild
+            ) {
+                if (
+                !$movements->contains(
+                    'id',
+                    $regularizedChild->id
+                )
+                ) {
+                    $additionalMovements->push(
+                        $regularizedChild
+                    );
+                }
+            }
+        }
+
+        $movements = $movements
+            ->concat($additionalMovements)
+            ->unique('id')
+            ->sortBy('id')
+            ->values();
+
+        foreach ($movements as $movement) {
+            $this->reverseFreeSaleCashMovement(
+                $movement,
+                $sale,
+                $reason
+            );
+        }
+
+        /*
+         * Los pagos parciales no se eliminan.
+         * Solo dejan de considerarse activos.
+         */
+        foreach ($partialPayments as $partialPayment) {
+            $partialPayment->state = 0;
+            $partialPayment->save();
+        }
+
+        $sale->internal_reversal_status = 'reversed';
+        $sale->internal_reversed_at = now();
+        $sale->internal_reversed_by = Auth::id();
+        $sale->save();
+    }
+
+    private function reverseFreeSaleCashMovement(
+        CashMovement $originalMovement,
+        Sale $sale,
+        string $reason
+    ) {
+        /*
+         * No revertimos movimientos que ya son, a su vez,
+         * movimientos compensatorios.
+         */
+        if (!empty($originalMovement->cash_movement_origin_id)) {
+            return;
+        }
+
+        /*
+         * Idempotencia por movimiento.
+         */
+        $existingReversal = CashMovement::query()
+            ->where(
+                'cash_movement_origin_id',
+                $originalMovement->id
+            )
+            ->first();
+
+        if ($existingReversal) {
+            return;
+        }
+
+        if (!$originalMovement->cash_register_id) {
+            throw new \Exception(
+                "El movimiento {$originalMovement->id} no tiene una sesión de caja asociada."
+            );
+        }
+
+        $cashRegister = CashRegister::query()
+            ->where(
+                'id',
+                $originalMovement->cash_register_id
+            )
+            ->lockForUpdate()
+            ->first();
+
+        if (!$cashRegister) {
+            throw new \Exception(
+                "No se encontró la sesión del movimiento {$originalMovement->id}."
+            );
+        }
+
+        /*
+         * sale e income incrementan el balance.
+         * expense lo reduce.
+         */
+        if (
+        in_array(
+            $originalMovement->type,
+            ['sale', 'income'],
+            true
+        )
+        ) {
+            $reversalType = 'expense';
+        } elseif (
+            $originalMovement->type === 'expense'
+        ) {
+            $reversalType = 'income';
+        } else {
+            throw new \Exception(
+                "El movimiento {$originalMovement->id} tiene un tipo no soportado."
+            );
+        }
+
+        /*
+         * impactAmount() devuelve cero si regularize = 0.
+         *
+         * El movimiento compensatorio conserva el estado de
+         * regularización del movimiento original.
+         */
+        $impactAmount = number_format(
+            (float) $originalMovement->impactAmount(),
+            2,
+            '.',
+            ''
+        );
+
+        $movementAmount = number_format(
+            (float) $originalMovement->amount,
+            2,
+            '.',
+            ''
+        );
+
+        CashMovement::create([
+            'cash_register_id' =>
+                $cashRegister->id,
+
+            'type' => $reversalType,
+
+            /*
+             * Conservamos el monto nominal original.
+             */
+            'amount' => $movementAmount,
+
+            'description' =>
+                'Reversión de movimiento por anulación de venta libre #' .
+                $sale->id,
+
+            'observation' =>
+                $reason .
+                '. Movimiento original #' .
+                $originalMovement->id,
+
+            /*
+             * Si el original estaba diferido, su reversión
+             * también queda sin impacto en el balance.
+             */
+            'regularize' =>
+                (bool) $originalMovement->regularize,
+
+            'amount_regularize' =>
+                $originalMovement->amount_regularize,
+
+            'commission' =>
+                $originalMovement->commission,
+
+            'cash_box_subtype_id' =>
+                $originalMovement->cash_box_subtype_id,
+
+            'sale_id' => $sale->id,
+
+            'cash_movement_origin_id' =>
+                $originalMovement->id,
+
+            'cash_movement_regularize_id' => null,
+
+            'arqueo' => false,
+        ]);
+
+        /*
+         * Si el movimiento original no afectó el balance,
+         * tampoco alteramos la sesión.
+         */
+        if ((float) $impactAmount <= 0) {
+            return;
+        }
+
+        if ($reversalType === 'expense') {
+            $cashRegister->current_balance =
+                bcsub(
+                    (string) $cashRegister->current_balance,
+                    $impactAmount,
+                    2
+                );
+
+            $cashRegister->total_expenses =
+                bcadd(
+                    (string) $cashRegister->total_expenses,
+                    $impactAmount,
+                    2
+                );
+        } else {
+            $cashRegister->current_balance =
+                bcadd(
+                    (string) $cashRegister->current_balance,
+                    $impactAmount,
+                    2
+                );
+
+            /*
+             * Un ingreso por reversión del vuelto no es una venta.
+             * Por ello no aumentamos total_sales.
+             *
+             * Si CashRegister cuenta con total_income,
+             * podrías incrementarlo aquí.
+             */
+        }
+
+        $cashRegister->save();
+    }
+
+    private function setFreeSaleAnnulmentRequestData(
+        Sale $sale,
+        string $reason,
+        string $type
+    ) {
+        $sale->annulment_status = 'pending';
+        $sale->annulment_type = $type;
+        $sale->annulment_reason = $reason;
+        $sale->annulment_requested_at = now();
+        $sale->annulment_requested_by = Auth::id();
+        $sale->save();
+    }
+
+    private function markFreeSaleAnnulmentAccepted(
+        Sale $sale,
+        string $type
+    ) {
+        $sale->state_annulled = 1;
+        $sale->annulment_status = 'accepted';
+        $sale->annulment_type = $type;
+        $sale->annulment_accepted_at = now();
+        $sale->annulled_by = Auth::id();
+
+        $sale->annulment_sunat_status =
+            $type === 'internal'
+                ? null
+                : $sale->annulment_sunat_status;
+
+        $sale->save();
+    }
+
+    public function consultAnnulment($id)
+    {
+        DB::beginTransaction();
+
+        try {
+            $sale = Sale::query()
+                ->where('free_sale', true)
+                ->lockForUpdate()
+                ->find($id);
+
+            if (!$sale) {
+                return response()->json([
+                    'message' =>
+                        'La venta libre no fue encontrada.',
+                ], 422);
+            }
+
+            if (
+            !in_array(
+                $sale->annulment_status,
+                ['pending', 'waiting_sunat_process'],
+                true
+            )
+            ) {
+                return response()->json([
+                    'message' =>
+                        'La venta libre no tiene una anulación pendiente para consultar.',
+                ], 422);
+            }
+
+            $result =
+                $this->consultarAnulacionNubefact($sale);
+
+            $reason =
+                $sale->annulment_reason
+                    ?: 'Consulta de anulación de venta libre';
+
+            $this->persistNubefactAnnulmentResult(
+                $sale,
+                $result,
+                $reason
+            );
+
+            $sale->refresh();
+
+            /*
+             * Normalmente la reversión ya se aplicó cuando se
+             * solicitó la baja. Esta condición garantiza idempotencia.
+             */
+            if (
+                $sale->internal_reversal_status !==
+                'reversed'
+            ) {
+                $this->reverseFreeSaleFinancially(
+                    $sale,
+                    'Reversión financiera luego de consultar la anulación'
+                );
+
+                $sale->refresh();
+            }
+
+            if ($sale->annulment_status === 'accepted') {
+                $sale->state_annulled = 1;
+                $sale->annulled_by =
+                    $sale->annulled_by ?: Auth::id();
+
+                $sale->annulment_accepted_at =
+                    $sale->annulment_accepted_at ?: now();
+
+                $sale->save();
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'message' =>
+                    $sale->annulment_status === 'accepted'
+                        ? 'SUNAT aceptó la anulación de la venta libre.'
+                        : (
+                    $sale->annulment_status === 'rejected'
+                        ? 'SUNAT rechazó la anulación de la venta libre.'
+                        : 'La anulación continúa pendiente en SUNAT.'
+                    ),
+
+                'annulment_status' =>
+                    $sale->annulment_status,
+
+                'pending_annulment' => in_array(
+                    $sale->annulment_status,
+                    ['pending', 'waiting_sunat_process'],
+                    true
+                ),
+
+                'internal_reversal_status' =>
+                    $sale->internal_reversal_status,
+            ], 200);
+
+        } catch (\Throwable $e) {
+            DB::rollBack();
+
+            report($e);
+
+            return response()->json([
+                'message' =>
+                    'No se pudo consultar la anulación: ' .
+                    $e->getMessage(),
+            ], 422);
+        }
     }
 }

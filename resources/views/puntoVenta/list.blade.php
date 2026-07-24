@@ -829,6 +829,7 @@
                 <div class="modal-body">
 
                     <input type="hidden" id="gc_sale_id">
+                    <input type="hidden" id="gc_free_sale" value="0">
 
                     <ul class="nav nav-tabs" id="gc_tabs" role="tablist">
                         <li class="nav-item">
@@ -848,7 +849,28 @@
                         <div class="tab-pane fade show active" id="gc_boleta" role="tabpanel">
                             <div class="form-group">
                                 <label>DNI <span class="text-danger">*</span></label>
-                                <input type="text" maxlength="8" id="gc_dni" class="form-control form-control-sm">
+                                {{--<input type="text" maxlength="8" id="gc_dni" class="form-control form-control-sm">--}}
+                                <div class="input-group input-group-sm">
+                                    <input
+                                            type="text"
+                                            maxlength="8"
+                                            id="gc_dni"
+                                            class="form-control"
+                                            inputmode="numeric"
+                                            autocomplete="off"
+                                    >
+
+                                    <div class="input-group-append">
+                                        <button
+                                                type="button"
+                                                id="btnBuscarGcDni"
+                                                class="btn btn-outline-primary"
+                                                title="Buscar DNI"
+                                        >
+                                            <i class="fas fa-search"></i>
+                                        </button>
+                                    </div>
+                                </div>
                             </div>
 
                             <div class="form-group">
@@ -865,7 +887,28 @@
                         <div class="tab-pane fade" id="gc_factura" role="tabpanel">
                             <div class="form-group">
                                 <label>RUC <span class="text-danger">*</span></label>
-                                <input type="text" maxlength="11" id="gc_ruc" class="form-control form-control-sm">
+                                {{--<input type="text" maxlength="11" id="gc_ruc" class="form-control form-control-sm">--}}
+                                <div class="input-group input-group-sm">
+                                    <input
+                                            type="text"
+                                            maxlength="11"
+                                            id="gc_ruc"
+                                            class="form-control"
+                                            inputmode="numeric"
+                                            autocomplete="off"
+                                    >
+
+                                    <div class="input-group-append">
+                                        <button
+                                                type="button"
+                                                id="btnBuscarGcRuc"
+                                                class="btn btn-outline-primary"
+                                                title="Buscar RUC"
+                                        >
+                                            <i class="fas fa-search"></i>
+                                        </button>
+                                    </div>
+                                </div>
                             </div>
 
                             <div class="form-group">
