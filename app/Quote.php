@@ -47,7 +47,8 @@ class Quote extends Model
         'discount_input_value',
         'gravada',
         'igv_total',
-        'total_importe'
+        'total_importe',
+        'renewed_from_quote_id',
     ];
 
     protected $dates = ['date_quote', 'created_at', 'date_vb_finances', 'date_vb_operations', 'date_validate'];
@@ -331,5 +332,21 @@ class Quote extends Model
     public function stockLotReservations()
     {
         return $this->hasMany(QuoteStockLot::class, 'quote_id');
+    }
+
+    public function originalQuote()
+    {
+        return $this->belongsTo(
+            Quote::class,
+            'renewed_from_quote_id'
+        );
+    }
+
+    public function renewedQuote()
+    {
+        return $this->hasOne(
+            Quote::class,
+            'renewed_from_quote_id'
+        );
     }
 }

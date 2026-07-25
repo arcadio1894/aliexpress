@@ -34,6 +34,7 @@ yarn-error.log
 
 /public/images/users/*
 !/public/images/users/no_image.png
+!/public/images/users/1.png
 
 /public/images/entries/*
 !/public/images/entries/no_image.png

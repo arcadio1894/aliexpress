@@ -29,6 +29,7 @@ use App\SalePartialPayment;
 use App\Services\InventoryCostService;
 use App\StockItem;
 use App\StockLot;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 use App\Material;
 use App\MaterialDiscountQuantity;
@@ -2466,7 +2467,7 @@ class PuntoVentaController extends Controller
 
             DB::commit();
 
-            $nubefactResult = null;
+            /*$nubefactResult = null;
 
             $urlPrint = route('puntoVenta.print', $sale->id);
             $printType = 'ticket';
@@ -2517,6 +2518,203 @@ class PuntoVentaController extends Controller
                 // si por alguna manipulación llegó type_document 01 o 03
                 $sale->update([
                     'type_document' => null, // o '00' si usas código para ticket
+                    'sunat_status' => null,
+                    'sunat_message' => null,
+                ]);
+            }*/
+
+            $nubefactResult = null;
+
+            $urlPrint = route('puntoVenta.print', $sale->id);
+            $printType = 'ticket';
+
+            if ($pagosParcialesVenta === 'n') {
+
+                /*
+                 * Solo enviamos a Nubefact cuando el documento es:
+                 * 01 = Factura
+                 * 03 = Boleta
+                 */
+                if (in_array($sale->type_document, ['01', '03'])) {
+
+                    // =====================================================
+                    // 1. EMITIR EL COMPROBANTE EN NUBEFACT
+                    // =====================================================
+                    try {
+                        $sale->loadMissing([
+                            'details.material',
+                            'details.stockItem',
+                        ]);
+
+                        $nubefactResult = $this
+                            ->generarComprobanteNubefactParaVenta($sale);
+
+                        /*
+                         * Guardamos inmediatamente la información tributaria.
+                         *
+                         * En este punto Nubefact ya respondió correctamente.
+                         * Si después falla la descarga del PDF, no debemos
+                         * cambiar el estado del comprobante a Error.
+                         */
+                        $sale->update([
+                            'serie_sunat' => $nubefactResult['serie'] ?? null,
+
+                            'numero' => $nubefactResult['numero'] ?? null,
+
+                            'sunat_ticket' =>
+                                $nubefactResult['sunat_ticket'] ?? null,
+
+                            'sunat_status' =>
+                                $nubefactResult['sunat_description']
+                                ?? 'Enviado',
+
+                            'sunat_message' =>
+                                $nubefactResult['sunat_note'] ?? '',
+
+                            'fecha_emision' => now()->toDateString(),
+                        ]);
+
+                    } catch (\Throwable $e) {
+                        /*
+                         * Este catch corresponde únicamente a una falla
+                         * durante la emisión del comprobante.
+                         */
+                        Log::error(
+                            'Error al emitir comprobante POS en Nubefact',
+                            [
+                                'sale_id' => $sale->id,
+                                'error' => $e->getMessage(),
+                            ]
+                        );
+
+                        $sale->update([
+                            'sunat_status' => 'Error',
+                            'sunat_message' => $e->getMessage(),
+                        ]);
+                    }
+
+                    // =====================================================
+                    // 2. DESCARGAR PDF, XML Y CDR
+                    // =====================================================
+                    if (is_array($nubefactResult)) {
+                        try {
+                            $resultadoArchivos =
+                                $this->persistNubefactFilesAndUpdateSale(
+                                    $sale,
+                                    $nubefactResult
+                                );
+
+                            /*
+                             * La función intenta descargar cada archivo
+                             * independientemente.
+                             *
+                             * Puede descargar PDF y XML correctamente,
+                             * aunque el CDR falle temporalmente.
+                             */
+                            if (!empty($resultadoArchivos['errores'])) {
+                                Log::warning(
+                                    'Comprobante POS emitido con archivos pendientes',
+                                    [
+                                        'sale_id' => $sale->id,
+                                        'errores' =>
+                                            $resultadoArchivos['errores'],
+                                    ]
+                                );
+                            }
+
+                        } catch (\Throwable $e) {
+                            /*
+                             * Este error ya no modifica sunat_status.
+                             *
+                             * El comprobante pudo haberse emitido correctamente,
+                             * aunque exista un problema de carpetas, permisos
+                             * o almacenamiento local.
+                             */
+                            Log::error(
+                                'Comprobante POS emitido, pero falló el almacenamiento de archivos',
+                                [
+                                    'sale_id' => $sale->id,
+                                    'error' => $e->getMessage(),
+                                ]
+                            );
+                        }
+
+                        /*
+                         * Recargamos la venta para obtener los valores actuales
+                         * de pdf_path, xml_path y cdr_path.
+                         */
+                        $sale->refresh();
+                    }
+
+                    // =====================================================
+                    // 3. DETERMINAR EL ARCHIVO PARA IMPRESIÓN
+                    // =====================================================
+
+                    /*
+                     * Primera prioridad:
+                     * utilizar el PDF local, pero solo cuando sea realmente
+                     * un archivo PDF válido.
+                     */
+                    if (!empty($sale->pdf_path)) {
+                        $localPath = public_path(
+                            'comprobantes/pdfs/' . $sale->pdf_path
+                        );
+
+                        if (
+                            is_file($localPath) &&
+                            filesize($localPath) >= 5
+                        ) {
+                            $cabeceraPdf = file_get_contents(
+                                $localPath,
+                                false,
+                                null,
+                                0,
+                                5
+                            );
+
+                            if ($cabeceraPdf === '%PDF-') {
+                                $urlPrint = asset(
+                                    'comprobantes/pdfs/' . $sale->pdf_path
+                                );
+
+                                $printType = 'sunat_pdf';
+                            }
+                        }
+                    }
+
+                    /*
+                     * Segunda prioridad:
+                     * si no existe un PDF local válido, utilizamos el enlace
+                     * directo que Nubefact devolvió en esta operación.
+                     */
+                    if (
+                        $printType !== 'sunat_pdf' &&
+                        !empty($nubefactResult['enlace_del_pdf'])
+                    ) {
+                        $urlPrint =
+                            $nubefactResult['enlace_del_pdf'];
+
+                        $printType = 'sunat_pdf';
+                    }
+                }
+
+            } else {
+                // =========================================================
+                // PAGO PARCIAL: SIEMPRE TICKET LOCAL
+                // =========================================================
+                $urlPrint = route(
+                    'puntoVenta.print',
+                    $sale->id
+                );
+
+                $printType = 'ticket';
+
+                /*
+                 * Evitamos que una venta con pago parcial quede
+                 * accidentalmente asociada a una boleta o factura.
+                 */
+                $sale->update([
+                    'type_document' => null,
                     'sunat_status' => null,
                     'sunat_message' => null,
                 ]);
@@ -3043,12 +3241,68 @@ class PuntoVentaController extends Controller
                 $tipo_documento_cliente = 'ruc';
             }
 
-            $printUrl = route('puntoVenta.print', $sale->id); // ticket por defecto
+            /*$printUrl = route('puntoVenta.print', $sale->id); // ticket por defecto
 
             if (!empty($sale->pdf_path)) {
                 // PDF local guardado
                 $printUrl = asset('comprobantes/pdfs/' . $sale->pdf_path);
+            }*/
+            $esComprobanteElectronico = in_array(
+                $sale->type_document,
+                ['01', '03']
+            );
+
+            $pdfLocalValido = false;
+            $pdfLocalPath = null;
+
+            if (!empty($sale->pdf_path)) {
+                $pdfLocalPath = public_path(
+                    'comprobantes/pdfs/' . $sale->pdf_path
+                );
+
+                if (
+                    is_file($pdfLocalPath) &&
+                    filesize($pdfLocalPath) >= 5
+                ) {
+                    $cabeceraPdf = file_get_contents(
+                        $pdfLocalPath,
+                        false,
+                        null,
+                        0,
+                        5
+                    );
+
+                    $pdfLocalValido = $cabeceraPdf === '%PDF-';
+                }
             }
+
+            /*
+             * Para una venta normal usamos el ticket local.
+             *
+             * Para boleta o factura:
+             * - si existe PDF válido, usamos el PDF;
+             * - si no existe, no enviamos una URL falsa al PDF.
+             */
+            if ($esComprobanteElectronico) {
+                $printUrl = $pdfLocalValido
+                    ? asset('comprobantes/pdfs/' . $sale->pdf_path)
+                    : null;
+            } else {
+                $printUrl = route('puntoVenta.print', $sale->id);
+            }
+
+            /*
+             * Se puede recuperar cuando:
+             * - es boleta o factura;
+             * - la emisión no está marcada como error;
+             * - no hay un PDF local válido;
+             * - la venta no está anulada.
+             */
+            $puedeRecuperarArchivosNubefact =
+                $esComprobanteElectronico &&
+                $sale->sunat_status !== 'Error' &&
+                !$pdfLocalValido &&
+                (int) $sale->state_annulled !== 1;
 
             // ===============================
             // NUEVO: obtener canal de pago desde CashMovement
@@ -3251,8 +3505,20 @@ class PuntoVentaController extends Controller
                 "direccion_cliente" => $this->cleanUtf8($sale->direccion_cliente),
                 "email_cliente" => $this->cleanUtf8($sale->email_cliente),
                 "tipo_comprobante" => $tipo_comprobante,
-                "print_url" => $this->cleanUtf8($printUrl),
-                "print_label" => !empty($sale->pdf_path) ? 'Ver PDF' : 'Ver Ticket',
+                /*"print_url" => $this->cleanUtf8($printUrl),
+                "print_label" => !empty($sale->pdf_path) ? 'Ver PDF' : 'Ver Ticket',*/
+                "print_url" => $printUrl
+                    ? $this->cleanUtf8($printUrl)
+                    : null,
+
+                "print_label" => $esComprobanteElectronico
+                    ? ($pdfLocalValido ? 'Ver PDF' : 'PDF no disponible')
+                    : 'Ver Ticket',
+
+                "pdf_local_valido" => $pdfLocalValido,
+
+                "can_retry_nubefact_files" =>
+                    $puedeRecuperarArchivosNubefact,
                 "type_document" => $sale->type_document,
                 "sunat_status" => $sale->sunat_status,
                 "pagos_parciales_venta" => $sale->pagos_parciales_venta,
@@ -4197,20 +4463,18 @@ class PuntoVentaController extends Controller
 
         /*
          * ============================================================
-         * 4) CANCELAR COTIZACIÓN SI LA VENTA TENÍA ITEMS
+         * 4) ACTUALIZAR ESTADO DE LA COTIZACIÓN
          * ============================================================
          *
-         * Al generar la venta, QuoteStockLot fue eliminado porque era
-         * una reserva temporal.
+         * Si la venta retiró al menos un Item físico:
+         * - La cotización no puede reconstruir la selección.
+         * - Se marca como canceled.
          *
-         * Como la cotización ya no puede reconstruir correctamente sus
-         * items seleccionados, evitamos que vuelva a aparecer como una
-         * cotización disponible para facturar.
-         *
-         * Las cotizaciones sin productos itemeables conservan el
-         * comportamiento anterior.
-         */
-        if (
+         * Si no retiró Items físicos:
+         * - Puede utilizarse como origen para recotizar.
+         * - Se marca como requote.
+        */
+        /*if (
             $hasItemizedProducts &&
             !empty($sale->quote_id)
         ) {
@@ -4220,6 +4484,19 @@ class PuntoVentaController extends Controller
 
             if ($quote && $quote->state !== 'canceled') {
                 $quote->state = 'canceled';
+                $quote->save();
+            }
+        }*/
+        if (!empty($sale->quote_id)) {
+            $quote = Quote::where('id', $sale->quote_id)
+                ->lockForUpdate()
+                ->first();
+
+            if ($quote) {
+                $quote->state = $hasItemizedProducts
+                    ? 'canceled'
+                    : 'requote';
+
                 $quote->save();
             }
         }
@@ -6240,6 +6517,287 @@ class PuntoVentaController extends Controller
                 'message' => $e->getMessage(),
                 'file' => $e->getFile(),
                 'line' => $e->getLine(),
+            ], 422);
+        }
+    }
+
+    public function recuperarArchivosNubefact(Sale $sale)
+    {
+        /*
+         * Solo permitimos recuperar archivos de boletas y facturas.
+         */
+        if (!in_array($sale->type_document, ['01', '03'])) {
+            return response()->json([
+                'message' =>
+                    'Esta venta no tiene una boleta o factura electrónica.',
+            ], 422);
+        }
+
+        /*
+         * No intentamos recuperar archivos cuando la emisión inicial
+         * fue registrada como fallida.
+         */
+        if ($sale->sunat_status === 'Error') {
+            return response()->json([
+                'message' =>
+                    'El comprobante tiene un error de emisión. Primero debe resolverse el error tributario.',
+            ], 422);
+        }
+
+        /*
+         * Para consultar un comprobante existente necesitamos
+         * necesariamente su serie y número.
+         */
+        if (
+            empty($sale->serie_sunat) ||
+            empty($sale->numero)
+        ) {
+            return response()->json([
+                'message' =>
+                    'La venta no tiene serie o número SUNAT para consultar el comprobante.',
+            ], 422);
+        }
+
+        try {
+            /*
+             * 1. Consultar el comprobante existente.
+             *
+             * Esta función no vuelve a emitirlo.
+             */
+            $nubefactResult =
+                $this->consultarComprobanteNubefact($sale);
+
+            /*
+             * 2. Descargar y validar PDF, XML y CDR.
+             *
+             * Esta función ya utiliza:
+             * - tres intentos;
+             * - validación de PDF;
+             * - validación de XML;
+             * - validación de ZIP;
+             * - archivos temporales;
+             * - logs.
+             */
+            $resultadoArchivos =
+                $this->persistNubefactFilesAndUpdateSale(
+                    $sale,
+                    $nubefactResult
+                );
+
+            /*
+             * Recargar los campos actualizados:
+             * pdf_path, xml_path y cdr_path.
+             */
+            $sale->refresh();
+
+            $archivosRecuperados = [];
+
+            if (!empty($resultadoArchivos['pdf_descargado'])) {
+                $archivosRecuperados[] = 'PDF';
+            }
+
+            if (!empty($resultadoArchivos['xml_descargado'])) {
+                $archivosRecuperados[] = 'XML';
+            }
+
+            if (!empty($resultadoArchivos['cdr_descargado'])) {
+                $archivosRecuperados[] = 'CDR';
+            }
+
+            /*
+             * Ningún archivo pudo recuperarse.
+             */
+            if (empty($archivosRecuperados)) {
+                Log::warning(
+                    'No se recuperó ningún archivo de Nubefact',
+                    [
+                        'sale_id' => $sale->id,
+                        'errores' =>
+                            $resultadoArchivos['errores'] ?? [],
+                    ]
+                );
+
+                return response()->json([
+                    'message' =>
+                        'Nubefact respondió, pero no fue posible descargar ningún archivo válido.',
+
+                    'errors' =>
+                        $resultadoArchivos['errores'] ?? [],
+                ], 422);
+            }
+
+            /*
+             * Algunos archivos se recuperaron, pero otros fallaron.
+             */
+            if (!empty($resultadoArchivos['errores'])) {
+                Log::warning(
+                    'Comprobante recuperado parcialmente',
+                    [
+                        'sale_id' => $sale->id,
+                        'archivos_recuperados' =>
+                            $archivosRecuperados,
+                        'errores' =>
+                            $resultadoArchivos['errores'],
+                    ]
+                );
+
+                return response()->json([
+                    'message' =>
+                        'Se recuperaron: '
+                        . implode(', ', $archivosRecuperados)
+                        . '. Algunos archivos continúan pendientes.',
+
+                    'partial' => true,
+
+                    'files' => [
+                        'pdf' => !empty(
+                        $resultadoArchivos['pdf_descargado']
+                        ),
+                        'xml' => !empty(
+                        $resultadoArchivos['xml_descargado']
+                        ),
+                        'cdr' => !empty(
+                        $resultadoArchivos['cdr_descargado']
+                        ),
+                    ],
+
+                    'errors' =>
+                        $resultadoArchivos['errores'],
+
+                    'pdf_url' => !empty($sale->pdf_path)
+                        ? asset(
+                            'comprobantes/pdfs/'
+                            . $sale->pdf_path
+                        )
+                        : null,
+                ], 200);
+            }
+
+            /*
+             * Recuperación completa.
+             */
+            return response()->json([
+                'message' =>
+                    'Los archivos del comprobante fueron recuperados correctamente.',
+
+                'partial' => false,
+
+                'files' => [
+                    'pdf' => true,
+                    'xml' => !empty($sale->xml_path),
+                    'cdr' => !empty($sale->cdr_path),
+                ],
+
+                'pdf_url' => !empty($sale->pdf_path)
+                    ? asset(
+                        'comprobantes/pdfs/'
+                        . $sale->pdf_path
+                    )
+                    : null,
+            ], 200);
+
+        } catch (\Throwable $e) {
+            Log::error(
+                'Error recuperando archivos del comprobante',
+                [
+                    'sale_id' => $sale->id,
+                    'serie' => $sale->serie_sunat,
+                    'numero' => $sale->numero,
+                    'error' => $e->getMessage(),
+                ]
+            );
+
+            /*
+             * No cambiamos sunat_status a Error.
+             *
+             * Este proceso no corresponde a una nueva emisión;
+             * solamente intenta recuperar archivos.
+             */
+            return response()->json([
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    public function probarConsultaComprobanteNubefact($saleId)
+    {
+        /*
+         * Este método es solo para ambiente local/desarrollo.
+         * Evita que pueda ejecutarse accidentalmente en producción.
+         */
+        if (!app()->environment('local')) {
+            return response()->json([
+                'message' => 'Esta prueba solo está disponible en desarrollo.',
+            ], 403);
+        }
+
+        $sale = Sale::find($saleId);
+
+        if (!$sale) {
+            return response()->json([
+                'message' => 'No se encontró la venta indicada.',
+            ], 404);
+        }
+
+        if (!in_array($sale->type_document, ['01', '03'])) {
+            return response()->json([
+                'message' => 'La venta no corresponde a una boleta o factura.',
+                'sale_id' => $sale->id,
+                'type_document' => $sale->type_document,
+            ], 422);
+        }
+
+        if (empty($sale->serie_sunat) || empty($sale->numero)) {
+            return response()->json([
+                'message' => 'La venta no tiene serie o número SUNAT.',
+                'sale_id' => $sale->id,
+                'serie_sunat' => $sale->serie_sunat,
+                'numero' => $sale->numero,
+            ], 422);
+        }
+
+        try {
+            /*
+             * Solo consulta.
+             * No descarga ni guarda archivos.
+             */
+            $resultado = $this->consultarComprobanteNubefact($sale);
+
+            Log::info('Prueba de consulta de comprobante Nubefact', [
+                'sale_id' => $sale->id,
+                'serie' => $sale->serie_sunat,
+                'numero' => $sale->numero,
+                'resultado' => $resultado,
+            ]);
+
+            return response()->json([
+                'message' => 'Consulta realizada correctamente.',
+                'venta' => [
+                    'id' => $sale->id,
+                    'tipo_documento' => $sale->type_document,
+                    'serie' => $sale->serie_sunat,
+                    'numero' => $sale->numero,
+                    'estado_sunat' => $sale->sunat_status,
+                ],
+                'respuesta_nubefact' => $resultado,
+            ], 200);
+
+        } catch (\Throwable $e) {
+            Log::error('Error en prueba de consulta Nubefact', [
+                'sale_id' => $sale->id,
+                'serie' => $sale->serie_sunat,
+                'numero' => $sale->numero,
+                'error' => $e->getMessage(),
+            ]);
+
+            return response()->json([
+                'message' => $e->getMessage(),
+                'venta' => [
+                    'id' => $sale->id,
+                    'tipo_documento' => $sale->type_document,
+                    'serie' => $sale->serie_sunat,
+                    'numero' => $sale->numero,
+                ],
             ], 422);
         }
     }

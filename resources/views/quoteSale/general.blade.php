@@ -452,9 +452,9 @@
         <button data-reactivar data-active_quote="{{--'+item.id+'--}}" data-name="{{--'+item.description_quote+'--}}" class="btn btn-outline-warning btn-sm" data-toggle="tooltip" data-placement="top" title="Reactivar"><i class="fas fa-lock-open"></i></button>
     </template>
 
-    <template id="template-btn_canceled">
-        <a data-ver_cotizacion href="{{--'+document.location.origin+ '/dashboard/ver/cotizacion/'+item.id+'--}}" class="btn btn-outline-primary btn-sm" data-toggle="tooltip" data-placement="top" title="Ver Detalles"><i class="fa fa-eye"></i></a>
-        {{--<button data-recotizar data-renew="--}}{{--'+item.id+'--}}{{--" data-name="--}}{{--'+item.description_quote+'--}}{{--" class="btn btn-outline-success btn-sm" data-toggle="tooltip" data-placement="top" title="Recotizar"><i class="fas fa-sync"></i></button>--}}
+    <template id="template-btn_requote">
+        <a data-ver_cotizacion href="" class="btn btn-outline-primary btn-sm" data-toggle="tooltip" data-placement="top" title="Ver Detalles"><i class="fa fa-eye"></i></a>
+        <button data-recotizar data-renew="" data-name="" class="btn btn-outline-success btn-sm" data-toggle="tooltip" data-placement="top" title="Recotizar"><i class="fas fa-sync"></i></button>
     </template>
 
     {{--<template id="template-btn_VB_finance">

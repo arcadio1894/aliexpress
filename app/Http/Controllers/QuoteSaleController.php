@@ -31,6 +31,7 @@ use App\Output;
 use App\OutputDetail;
 use App\PaymentDeadline;
 use App\PorcentageQuote;
+use App\PriceListItem;
 use App\PromotionLimit;
 use App\PromotionUsage;
 use App\Quote;
@@ -55,8 +56,10 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Barryvdh\DomPDF\Facade as PDF;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
 use Webklex\PDFMerger\Facades\PDFMergerFacade as PDFMerger;
 use Intervention\Image\Facades\Image;
 use App\Services\QuoteStockReservationService;
@@ -93,9 +96,9 @@ class QuoteSaleController extends Controller
             ["value" => "send", "display" => "ENVIADAS"],
             ["value" => "confirm", "display" => "CONFIRMADAS"],
             ["value" => "raised", "display" => "ELEVADAS"],
-            /*["value" => "VB_operation", "display" => "VB OPERACIONES"],*/
+            ["value" => "requote", "display" => "PARA RECOTIZAR"],
             ["value" => "close", "display" => "FINALIZADOS"],
-            ["value" => "canceled", "display" => "CANCELADAS"]
+            ["value" => "canceled", "display" => "ANULADAS"]
         ];
 
         $arrayUsers = User::select('id', 'name')->get()->toArray();
@@ -1720,6 +1723,726 @@ class QuoteSaleController extends Controller
         ], 200);
     }
 
+    public function renewQuote(Quote $quote)
+    {
+        try {
+            $renewQuote = DB::transaction(function () use ($quote) {
+                $begin = microtime(true);
+                /*
+                 * ==========================================================
+                 * 1. BLOQUEAR Y OBTENER LA COTIZACIÓN ORIGINAL
+                 * ==========================================================
+                 */
+                $originalQuote = Quote::query()
+                    ->where('id', $quote->id)
+                    ->with([
+                        'equipments.consumables.material',
+                        'equipments.consumables.stockItem',
+                        'equipments.workforces',
+                    ])
+                    ->lockForUpdate()
+                    ->firstOrFail();
+
+                /*
+                 * Solamente una cotización marcada para recotizar
+                 * puede utilizar esta operación.
+                 */
+                if ($originalQuote->state !== 'requote') {
+                    throw new \Exception(
+                        'La cotización seleccionada no está disponible para recotización.'
+                    );
+                }
+
+                /*
+                 * Una cotización original solamente puede generar
+                 * una nueva recotización.
+                 */
+                $alreadyRenewed = Quote::query()
+                    ->where('renewed_from_quote_id', $originalQuote->id)
+                    ->exists();
+
+                if ($alreadyRenewed) {
+                    throw new \Exception(
+                        'Esta cotización ya fue recotizada anteriormente.'
+                    );
+                }
+
+                /*
+                 * ==========================================================
+                 * 2. VALIDAR QUE SOLAMENTE EXISTA UN EQUIPO
+                 * ==========================================================
+                 */
+                if ($originalQuote->equipments->isEmpty()) {
+                    throw new \Exception(
+                        'La cotización no contiene productos para recotizar.'
+                    );
+                }
+
+                if ($originalQuote->equipments->count() > 1) {
+                    throw new \Exception(
+                        'La cotización contiene más de un grupo de productos y no puede recotizarse automáticamente.'
+                    );
+                }
+
+                /*
+                 * ==========================================================
+                 * 3. VALIDAR QUE NO EXISTAN PRODUCTOS ITEMEABLES
+                 * ==========================================================
+                 */
+                foreach ($originalQuote->equipments as $equipment) {
+                    foreach ($equipment->consumables as $consumable) {
+
+                        if (!$consumable->material) {
+                            throw new \Exception(
+                                'Uno de los productos no tiene un material asociado.'
+                            );
+                        }
+
+                        if ((int) $consumable->material->tipo_venta_id === 3) {
+                            throw new \Exception(
+                                'La cotización contiene productos con ítems físicos y no puede recotizarse automáticamente.'
+                            );
+                        }
+
+                        if (empty($consumable->stock_item_id)) {
+                            throw new \Exception(
+                                'El producto "' .
+                                $consumable->material->full_name .
+                                '" no tiene un StockItem asociado y no puede recotizarse automáticamente.'
+                            );
+                        }
+                    }
+                }
+
+                /*
+                 * ==========================================================
+                 * 4. CONFIGURACIÓN DE IGV
+                 * ==========================================================
+                 */
+                $dataIgv = DataGeneral::where('name', 'igv_venta')->first();
+
+                if (!$dataIgv) {
+                    throw new \Exception(
+                        'No se encontró la configuración del IGV de venta.'
+                    );
+                }
+
+                $igvPct = (float) $dataIgv->valueNumber;
+                $factor = 1 + ($igvPct / 100);
+
+                /*
+                 * Redondeo comercial equivalente a moneyRound().
+                 */
+                $moneyRound = function ($value) {
+                    return round((float) $value, 2);
+                };
+
+                /*
+                 * Redondeo utilizado para valores reales.
+                 */
+                $round10 = function ($value) {
+                    return round((float) $value, 10);
+                };
+
+                /*
+                 * ==========================================================
+                 * 5. CREAR LA NUEVA COTIZACIÓN
+                 * ==========================================================
+                 */
+                $renewQuote = Quote::create([
+                    /*
+                     * Código temporal para evitar conflictos con el índice unique.
+                     */
+                    'code' => 'TMP-' . Str::uuid(),
+
+                    'renewed_from_quote_id' => $originalQuote->id,
+
+                    'description_quote' => $originalQuote->description_quote,
+                    'observations' => $originalQuote->observations,
+
+                    'date_quote' => Carbon::now(),
+                    'date_validate' => Carbon::now()->addDays(5),
+
+                    'way_to_pay' => $originalQuote->way_to_pay,
+                    'delivery_time' => $originalQuote->delivery_time,
+
+                    'customer_id' => $originalQuote->customer_id,
+                    'contact_id' => $originalQuote->contact_id,
+                    'payment_deadline_id' => $originalQuote->payment_deadline_id,
+
+                    'state' => 'created',
+                    'currency_invoice' => $originalQuote->currency_invoice,
+
+                    /*
+                     * Se conserva la configuración del descuento.
+                     * Los importes serán recalculados posteriormente.
+                     */
+                    'discount_type' => $originalQuote->discount_type,
+                    'discount_input_mode' => $originalQuote->discount_input_mode,
+                    'discount_input_value' => $originalQuote->discount_input_value,
+
+                    'descuento' => 0,
+                    'gravada' => 0,
+                    'igv_total' => 0,
+                    'total_importe' => 0,
+                ]);
+
+                /*
+                 * Código definitivo.
+                 */
+                $renewQuote->code = 'COT-' . str_pad(
+                        $renewQuote->id,
+                        5,
+                        '0',
+                        STR_PAD_LEFT
+                    );
+
+                $renewQuote->save();
+
+                QuoteUser::create([
+                    'quote_id' => $renewQuote->id,
+                    'user_id' => Auth::id(),
+                ]);
+
+                /** @var QuoteStockReservationService $reservationService */
+                $reservationService = app(QuoteStockReservationService::class);
+
+                /*
+                 * Totales que reproducen el comportamiento del frontend.
+                 */
+                $subtotalConsumablesWithIgvReal = 0;
+                $discountPromotions = 0;
+                $servicesSumBillable = 0;
+
+                /*
+                 * ==========================================================
+                 * 6. COPIAR EQUIPOS
+                 * ==========================================================
+                 */
+                foreach ($originalQuote->equipments as $originalEquipment) {
+
+                    $renewEquipment = Equipment::create([
+                        'quote_id' => $renewQuote->id,
+                        'description' => $originalEquipment->description ?: '',
+                        'detail' => $originalEquipment->detail ?: '',
+                        'quantity' => $originalEquipment->quantity ?: 1,
+                        'utility' => $originalEquipment->utility ?: 0,
+                        'rent' => $originalEquipment->rent ?: 0,
+                        'letter' => $originalEquipment->letter ?: 0,
+                        'total' => 0,
+                    ]);
+
+                    $totalConsumablesForEquipment = 0;
+                    $totalWorkforcesForEquipment = 0;
+
+                    /*
+                     * ======================================================
+                     * 6.1. CONSUMIBLES
+                     * ======================================================
+                     */
+                    foreach ($originalEquipment->consumables as $originalConsumable) {
+
+                        $stockItem = StockItem::query()
+                            ->with([
+                                'material',
+                            ])
+                            ->where('id', $originalConsumable->stock_item_id)
+                            ->where('is_active', true)
+                            ->first();
+
+                        if (!$stockItem) {
+                            throw new \Exception(
+                                'Uno de los productos ya no se encuentra activo o disponible.'
+                            );
+                        }
+
+                        if (!$stockItem->material) {
+                            throw new \Exception(
+                                'El producto con ID ' .
+                                $originalConsumable->stock_item_id .
+                                ' no tiene material asociado.'
+                            );
+                        }
+
+                        if ((int) $stockItem->material->tipo_venta_id === 3) {
+                            throw new \Exception(
+                                'El producto "' .
+                                $stockItem->material->full_name .
+                                '" requiere selección de ítems físicos y no puede recotizarse.'
+                            );
+                        }
+
+                        /*
+                         * No modificamos la cantidad solicitada originalmente.
+                         */
+                        $requestedUnits = (float) $originalConsumable->quantity;
+
+                        if ($requestedUnits <= 0) {
+                            throw new \Exception(
+                                'El producto "' .
+                                $stockItem->material->full_name .
+                                '" tiene una cantidad inválida.'
+                            );
+                        }
+
+                        $presentationId = $originalConsumable
+                            ->material_presentation_id;
+
+                        $packs = $originalConsumable->packs;
+                        $unitsPerPack = $originalConsumable->units_per_pack;
+
+                        $currentPrice = 0;
+                        $lineQuantityForPrice = $requestedUnits;
+
+                        /*
+                         * ==================================================
+                         * PRODUCTO CON PRESENTACIÓN
+                         * ==================================================
+                         */
+                        if (!empty($presentationId)) {
+
+                            $presentation = MaterialPresentation::query()
+                                ->where('id', $presentationId)
+                                ->where(
+                                    'material_id',
+                                    $stockItem->material_id
+                                )
+                                ->where('active', 1)
+                                ->first();
+
+                            if (!$presentation) {
+                                throw new \Exception(
+                                    'La presentación del producto "' .
+                                    $stockItem->material->full_name .
+                                    '" ya no se encuentra activa.'
+                                );
+                            }
+
+                            if (
+                                empty($packs) ||
+                                (int) $packs <= 0 ||
+                                empty($unitsPerPack) ||
+                                (int) $unitsPerPack <= 0
+                            ) {
+                                throw new \Exception(
+                                    'La presentación del producto "' .
+                                    $stockItem->material->full_name .
+                                    '" contiene información inválida.'
+                                );
+                            }
+
+                            /*
+                             * Si la presentación cambió su cantidad,
+                             * no alteramos silenciosamente lo solicitado.
+                             */
+                            if (
+                                (int) $presentation->quantity !==
+                                (int) $unitsPerPack
+                            ) {
+                                throw new \Exception(
+                                    'La presentación del producto "' .
+                                    $stockItem->material->full_name .
+                                    '" cambió su cantidad de unidades. Revise el producto manualmente.'
+                                );
+                            }
+
+                            $currentPrice = (float) $presentation->price;
+                            $lineQuantityForPrice = (float) $packs;
+
+                        } else {
+
+                            /*
+                             * ==================================================
+                             * PRODUCTO POR UNIDAD
+                             * ==================================================
+                             */
+                            $priceListItem = PriceListItem::query()
+                                ->where(
+                                    'stock_item_id',
+                                    $stockItem->id
+                                )
+                                ->whereHas('priceList', function ($query) {
+                                    $query->where('is_default', true)
+                                        ->where('is_active', true);
+                                })
+                                ->first();
+
+                            if (!$priceListItem) {
+                                throw new \Exception(
+                                    'El producto "' .
+                                    $stockItem->display_name .
+                                    '" no tiene un precio configurado en la lista predeterminada.'
+                                );
+                            }
+
+                            $currentPrice = (float) $priceListItem->price;
+                        }
+
+                        if ($currentPrice <= 0) {
+                            throw new \Exception(
+                                'El producto "' .
+                                $stockItem->display_name .
+                                '" tiene un precio inválido o igual a cero.'
+                            );
+                        }
+
+                        /*
+                         * Precio con IGV y valor unitario sin IGV.
+                         */
+                        $priceReal = $round10($currentPrice);
+                        $valorUnitarioReal = $round10(
+                            $priceReal / $factor
+                        );
+
+                        $importeReal = $round10(
+                            $lineQuantityForPrice * $priceReal
+                        );
+
+                        /*
+                         * ==================================================
+                         * VALIDAR STOCK ACTUAL
+                         * ==================================================
+                         */
+                        $available = $reservationService
+                            ->getAvailableStockByStockItem(
+                                (int) $stockItem->id
+                            );
+
+                        if ($requestedUnits > $available) {
+                            throw new \Exception(
+                                'El producto "' .
+                                $stockItem->material->full_name .
+                                '" no cuenta con stock suficiente. ' .
+                                'Requerido: ' .
+                                $requestedUnits .
+                                '. Disponible: ' .
+                                $available .
+                                '.'
+                            );
+                        }
+
+                        /*
+                         * ==================================================
+                         * CREAR EL NUEVO CONSUMIBLE
+                         * ==================================================
+                         */
+                        $renewConsumable = EquipmentConsumable::create([
+                            'equipment_id' => $renewEquipment->id,
+                            'material_id' => $stockItem->material_id,
+                            'stock_item_id' => $stockItem->id,
+
+                            /*
+                             * Se conserva la cantidad real solicitada.
+                             */
+                            'quantity' => $requestedUnits,
+
+                            'price' => $priceReal,
+                            'valor_unitario' => $valorUnitarioReal,
+                            'total' => $importeReal,
+
+                            /*
+                             * Se conserva el descuento específico anterior.
+                             */
+                            'discount' => $originalConsumable->discount ?: 0,
+                            'type_promo' => $originalConsumable->type_promo,
+
+                            'material_presentation_id' => $presentationId,
+                            'packs' => $packs,
+                            'units_per_pack' => $unitsPerPack,
+
+                            'state' => 'En compra',
+                            'availability' => 'Completo',
+                        ]);
+
+                        /*
+                         * Crear las reservas de la nueva cotización.
+                         */
+                        $reservationService->reserveForQuoteDetail(
+                            (int) $renewQuote->id,
+                            (int) $renewConsumable->id,
+                            (int) $stockItem->id,
+                            $requestedUnits
+                        );
+
+                        /*
+                         * Totales del equipo, siguiendo store().
+                         */
+                        $totalConsumablesForEquipment = $round10(
+                            $totalConsumablesForEquipment +
+                            $importeReal
+                        );
+
+                        /*
+                         * Totales generales, siguiendo confirmEquipment().
+                         */
+                        $subtotalConsumablesWithIgvReal = $round10(
+                            $subtotalConsumablesWithIgvReal +
+                            $importeReal
+                        );
+
+                        $discountPromotions = $round10(
+                            $discountPromotions +
+                            (float) ($originalConsumable->discount ?: 0)
+                        );
+                    }
+
+                    /*
+                     * ======================================================
+                     * 6.2. SERVICIOS ADICIONALES
+                     * ======================================================
+                     */
+                    foreach ($originalEquipment->workforces as $originalWorkforce) {
+
+                        $billable = isset($originalWorkforce->billable)
+                            ? (int) $originalWorkforce->billable
+                            : 1;
+
+                        $renewWorkforce = EquipmentWorkforce::create([
+                            'equipment_id' => $renewEquipment->id,
+                            'description' => $originalWorkforce->description ?: '',
+                            'price' => (float) $originalWorkforce->price,
+                            'quantity' => (float) $originalWorkforce->quantity,
+                            'total' => (float) $originalWorkforce->total,
+                            'unit' => $originalWorkforce->unit ?: '',
+                            'billable' => $billable,
+                        ]);
+
+                        /*
+                         * Store suma todos los servicios para equipment.total.
+                         */
+                        $totalWorkforcesForEquipment = $round10(
+                            $totalWorkforcesForEquipment +
+                            (float) $renewWorkforce->total
+                        );
+
+                        /*
+                         * Para total_importe solamente se consideran
+                         * los servicios facturables.
+                         */
+                        if ($billable === 1) {
+                            $servicesSumBillable = $round10(
+                                $servicesSumBillable +
+                                (float) $renewWorkforce->total
+                            );
+                        }
+                    }
+
+                    /*
+                     * ======================================================
+                     * 6.3. TOTAL DEL EQUIPO SEGÚN STORE ACTUAL
+                     * ======================================================
+                     */
+                    $totalEquipment = $round10(
+                        (
+                            $totalConsumablesForEquipment +
+                            $totalWorkforcesForEquipment
+                        ) * (float) $renewEquipment->quantity
+                    );
+
+                    $renewEquipment->total = $totalEquipment;
+                    $renewEquipment->save();
+                }
+
+                /*
+                 * ==========================================================
+                 * 7. RECALCULAR TOTALES DE LA COTIZACIÓN
+                 * ==========================================================
+                 */
+
+                /*
+                 * Descuentos de promociones guardados en las líneas.
+                 */
+                $subtotalConsumablesWithIgvReal = $round10(
+                    $subtotalConsumablesWithIgvReal -
+                    $discountPromotions
+                );
+
+                if ($subtotalConsumablesWithIgvReal < 0) {
+                    $subtotalConsumablesWithIgvReal = 0;
+                }
+
+                $subtotalWithIgvReal = $round10(
+                    $subtotalConsumablesWithIgvReal +
+                    $servicesSumBillable
+                );
+
+                /*
+                 * Reproducir computeDiscountWithIgv().
+                 */
+                $discountType = $originalQuote->discount_type ?: 'amount';
+
+                $discountInputMode = $originalQuote
+                    ->discount_input_mode ?: 'without_igv';
+
+                $discountInputValue = (float) (
+                $originalQuote->discount_input_value ?: 0
+                );
+
+                $discountWithIgv = 0;
+
+                if ($discountInputValue > 0) {
+
+                    if ($discountType === 'amount') {
+
+                        $discountWithIgv =
+                            $discountInputMode === 'with_igv'
+                                ? $discountInputValue
+                                : $moneyRound(
+                                $discountInputValue * $factor
+                            );
+
+                    } else {
+
+                        $percentage = $discountInputValue / 100;
+
+                        if ($discountInputMode === 'with_igv') {
+                            $discountWithIgv = $moneyRound(
+                                $subtotalWithIgvReal *
+                                $percentage
+                            );
+                        } else {
+                            $discountWithIgv = $moneyRound(
+                                (
+                                    $subtotalWithIgvReal /
+                                    $factor
+                                ) *
+                                $percentage *
+                                $factor
+                            );
+                        }
+                    }
+
+                    if ($discountWithIgv > $subtotalWithIgvReal) {
+                        $discountWithIgv = $subtotalWithIgvReal;
+                    }
+                }
+
+                $discountWithIgv = $moneyRound(
+                    $discountWithIgv
+                );
+
+                $totalFinalWithIgvReal = $round10(
+                    $subtotalWithIgvReal -
+                    $discountWithIgv
+                );
+
+                if ($totalFinalWithIgvReal < 0) {
+                    $totalFinalWithIgvReal = 0;
+                }
+
+                $baseFinalReal = $round10(
+                    $totalFinalWithIgvReal /
+                    $factor
+                );
+
+                if ($baseFinalReal < 0) {
+                    $baseFinalReal = 0;
+                }
+
+                $igvFinalReal = $round10(
+                    $totalFinalWithIgvReal -
+                    $baseFinalReal
+                );
+
+                $discountBaseReal = $round10(
+                    $discountWithIgv /
+                    $factor
+                );
+
+                /*
+                 * Guardar los totales reales.
+                 */
+                $renewQuote->descuento = $discountBaseReal;
+                $renewQuote->gravada = $baseFinalReal;
+                $renewQuote->igv_total = $igvFinalReal;
+                $renewQuote->total_importe = $totalFinalWithIgvReal;
+                $renewQuote->save();
+
+                /*
+                 * ==========================================================
+                 * 8. NOTIFICACIÓN
+                 * ==========================================================
+                 */
+                $notification = Notification::create([
+                    'content' =>
+                        $renewQuote->code .
+                        ' recotizada desde ' .
+                        $originalQuote->code .
+                        ' por ' .
+                        Auth::user()->name,
+
+                    'reason_for_creation' => 'renew_quote',
+
+                    'user_id' => Auth::id(),
+
+                    'url_go' => route(
+                        'quote.edit',
+                        $renewQuote->id
+                    ),
+                ]);
+
+                $users = User::role([
+                    'admin',
+                    'principal',
+                    'logistic'
+                ])->get();
+
+                foreach ($users as $user) {
+                    if ($user->id == Auth::id()) {
+                        continue;
+                    }
+
+                    foreach ($user->roles as $role) {
+                        NotificationUser::create([
+                            'notification_id' => $notification->id,
+                            'role_id' => $role->id,
+                            'user_id' => $user->id,
+                            'read' => false,
+                            'date_read' => null,
+                            'date_delete' => null,
+                        ]);
+                    }
+                }
+
+                /*
+                 * ==========================================================
+                 * 9. AUDITORÍA
+                 * ==========================================================
+                 */
+                $end = microtime(true) - $begin;
+
+                Audit::create([
+                    'user_id' => Auth::id(),
+                    'action' =>
+                        'Recotizar cotización de venta ' .
+                        $originalQuote->code .
+                        ' a ' .
+                        $renewQuote->code,
+                    'time' => $end,
+                ]);
+
+                return $renewQuote;
+            });
+
+            return response()->json([
+                'ok' => true,
+                'message' =>
+                    'La cotización ' .
+                    $renewQuote->code .
+                    ' fue creada correctamente.',
+                'url' => route('quoteSale.index'),
+            ], 200);
+
+        } catch (\Throwable $e) {
+            return response()->json([
+                'ok' => false,
+                'message' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ], 422);
+        }
+    }
+
     public function getAvailableStockFromLots($stockItemId)
     {
         return (float) StockLot::where('stock_item_id', $stockItemId)
@@ -1771,6 +2494,7 @@ class QuoteSaleController extends Controller
     public function getDataQuotesIndex(Request $request, $pageNumber = 1)
     {
         $perPage = 10;
+
         $description_quote = $request->input('description_quote');
         $year = $request->input('year');
         $code = $request->input('code');
@@ -1781,212 +2505,477 @@ class QuoteSaleController extends Controller
         $startDate = $request->input('startDate');
         $endDate = $request->input('endDate');
 
-        if ($startDate == "" || $endDate == "")
-        {
-            $query = Quote::with('customer', 'deadline', 'users')
-                ->whereNotIn('state', ['canceled', 'expired'])
-                ->where('state_active', 'open')
-                ->whereDoesntHave('sales', function ($q) {
-                    $q->where('state_annulled', 0);
-                })
-                ->orderBy('created_at', 'DESC');
+        /*
+         * ============================================================
+         * CONSULTA BASE
+         * ============================================================
+         */
+        $query = Quote::with([
+            'customer',
+            'deadline',
+            'users',
+            'equipments.workforces',
+        ])
+            ->whereNotIn('state', [
+                'canceled',
+                'expired',
+                'close',
+            ])
+            ->where('state_active', 'open')
 
-        } else {
-            $fechaInicio = Carbon::createFromFormat('d/m/Y', $startDate);
-            $fechaFinal  = Carbon::createFromFormat('d/m/Y', $endDate);
+            /*
+             * No mostrar cotizaciones que todavía tengan
+             * una venta activa asociada.
+             */
+            ->whereDoesntHave('sales', function ($q) {
+                $q->where('state_annulled', 0);
+            })
 
-            $query = Quote::with('customer', 'deadline', 'users')
-                ->whereNotIn('state', ['canceled', 'expired'])
-                ->where('state_active', 'open')
-                ->whereDate('date_quote', '>=', $fechaInicio)
-                ->whereDate('date_quote', '<=', $fechaFinal)
-                ->whereDoesntHave('sales', function ($q) {
-                    $q->where('state_annulled', 0);
-                })
-                ->orderBy('created_at', 'DESC');
+            /*
+             * ========================================================
+             * OCULTAR COTIZACIONES REQUOTE YA RECOTIZADAS
+             * ========================================================
+             *
+             * Se muestran:
+             * - Todas las cotizaciones cuyo estado no sea requote.
+             * - Las cotizaciones requote que todavía no tengan
+             *   una nueva cotización asociada.
+             *
+             * No se muestran:
+             * - Las cotizaciones requote que ya fueron utilizadas
+             *   como origen de otra cotización.
+             */
+            ->where(function ($q) {
+                $q->where('state', '<>', 'requote')
+                    ->orWhere(function ($requoteQuery) {
+                        $requoteQuery
+                            ->where('state', 'requote')
+                            ->whereDoesntHave('renewedQuote');
+                    });
+            });
+
+        /*
+         * ============================================================
+         * FILTRO POR FECHAS
+         * ============================================================
+         */
+        if ($startDate != "" && $endDate != "") {
+            $fechaInicio = Carbon::createFromFormat(
+                'd/m/Y',
+                $startDate
+            );
+
+            $fechaFinal = Carbon::createFromFormat(
+                'd/m/Y',
+                $endDate
+            );
+
+            $query->whereDate(
+                'date_quote',
+                '>=',
+                $fechaInicio
+            );
+
+            $query->whereDate(
+                'date_quote',
+                '<=',
+                $fechaFinal
+            );
         }
 
-        // Aplicar filtros si se proporcionan
+        /*
+         * ============================================================
+         * FILTROS GENERALES
+         * ============================================================
+         */
         if ($description_quote) {
-            $query->where('description_quote', 'LIKE', '%'.$description_quote.'%');
+            $query->where(
+                'description_quote',
+                'LIKE',
+                '%' . $description_quote . '%'
+            );
         }
 
         if ($year) {
-            $query->whereYear('date_quote', $year);
+            $query->whereYear(
+                'date_quote',
+                $year
+            );
         }
 
         if ($code) {
-            $query->where('code', 'LIKE', '%'.$code.'%');
-
+            $query->where(
+                'code',
+                'LIKE',
+                '%' . $code . '%'
+            );
         }
 
         if ($order) {
-            $query->where('code_customer', 'LIKE', '%'.$order.'%');
-
+            $query->where(
+                'code_customer',
+                'LIKE',
+                '%' . $order . '%'
+            );
         }
 
         if ($customer) {
-            $query->whereHas('customer', function ($query2) use ($customer) {
-                $query2->where('customer_id', $customer);
-            });
-
+            $query->whereHas(
+                'customer',
+                function ($query2) use ($customer) {
+                    $query2->where(
+                        'customer_id',
+                        $customer
+                    );
+                }
+            );
         }
 
-        if ($creator != "")
-        {
-            $query->whereHas('users', function ($query2) use ($creator) {
-                $query2->where('user_id', $creator);
-            });
+        if ($creator != "") {
+            $query->whereHas(
+                'users',
+                function ($query2) use ($creator) {
+                    $query2->where(
+                        'user_id',
+                        $creator
+                    );
+                }
+            );
         }
 
+        /*
+         * ============================================================
+         * FILTRO POR ESTADO
+         * ============================================================
+         */
         if ($stateQuote) {
-            // Creada, Enviada, confirmada, elevada, VB Finanzas, VB Operaciones, Finalizadas, Anuladas
-            // created, send, confirm, raised, VB_finance, VB_operation, close, canceled
             $query->where(function ($subquery) use ($stateQuote) {
-                $subquery->where(function ($q) use ($stateQuote) {
-                    switch ($stateQuote) {
-                        case 'created':
-                            $q->where('state', 'created')
-                                ->where(function ($q2) {
-                                    $q2->where('send_state', 0)
-                                        ->orWhere('send_state', false);
-                                });
-                            break;
-                        case 'send':
-                            $q->where('state', 'created')
-                                ->where(function ($q2) {
-                                    $q2->where('send_state', 1)
-                                        ->orWhere('send_state', true);
-                                });
-                            break;
-                        case 'close':
-                            $q->where('state_active', 'close');
-                            break;
-                        case 'raised':
-                            $q->where('state', 'confirmed')
-                                ->where('raise_status', 1)
-                                ->where('state', '<>','canceled')
-                                ->where('state_active', '<>','close');
-                            break;
-                        case 'confirm':
-                            $q->where('state', 'confirmed')
-                                ->where('raise_status', 0);
-                            break;
-                        case 'canceled':
-                            $q->where('state', 'canceled');
-                            break;
-                        default:
-                            // Lógica por defecto o manejo de errores si es necesario
-                            break;
-                    }
-                });
+                switch ($stateQuote) {
+                    case 'created':
+                        $subquery
+                            ->where('state', 'created')
+                            ->where(function ($q2) {
+                                $q2->where('send_state', 0)
+                                    ->orWhere('send_state', false);
+                            });
+                        break;
+
+                    case 'send':
+                        $subquery
+                            ->where('state', 'created')
+                            ->where(function ($q2) {
+                                $q2->where('send_state', 1)
+                                    ->orWhere('send_state', true);
+                            });
+                        break;
+
+                    case 'close':
+                        $subquery->where(
+                            'state_active',
+                            'close'
+                        );
+                        break;
+
+                    case 'raised':
+                        $subquery
+                            ->where('state', 'confirmed')
+                            ->where('raise_status', 1)
+                            ->where('state', '<>', 'canceled')
+                            ->where('state_active', '<>', 'close');
+                        break;
+
+                    case 'confirm':
+                        $subquery
+                            ->where('state', 'confirmed')
+                            ->where('raise_status', 0);
+                        break;
+
+                    case 'canceled':
+                        $subquery->where(
+                            'state',
+                            'canceled'
+                        );
+                        break;
+
+                    case 'requote':
+                        /*
+                         * Solamente devolverá las cotizaciones para
+                         * recotizar que todavía no fueron recotizadas.
+                         *
+                         * La condición whereDoesntHave('renewedQuote')
+                         * también está aplicada en la consulta base.
+                         */
+                        $subquery->where(
+                            'state',
+                            'requote'
+                        );
+                        break;
+
+                    default:
+                        break;
+                }
             });
         }
 
-        //$query = FinanceWork::with('quote', 'bank');
+        /*
+         * ============================================================
+         * ORDENAMIENTO Y PAGINACIÓN
+         * ============================================================
+         */
+        $query->orderBy(
+            'created_at',
+            'DESC'
+        );
 
         $totalFilteredRecords = $query->count();
-        $totalPages = ceil($totalFilteredRecords / $perPage);
 
-        $startRecord = ($pageNumber - 1) * $perPage + 1;
-        $endRecord = min($totalFilteredRecords, $pageNumber * $perPage);
+        $totalPages = (int) ceil(
+            $totalFilteredRecords / $perPage
+        );
 
-        $quotes = $query->skip(($pageNumber - 1) * $perPage)
+        $startRecord = $totalFilteredRecords > 0
+            ? (($pageNumber - 1) * $perPage) + 1
+            : 0;
+
+        $endRecord = min(
+            $totalFilteredRecords,
+            $pageNumber * $perPage
+        );
+
+        $quotes = $query
+            ->skip(($pageNumber - 1) * $perPage)
             ->take($perPage)
             ->get();
 
-        //dd($proformas);
-
+        /*
+         * ============================================================
+         * FORMATEAR RESPUESTA
+         * ============================================================
+         */
         $array = [];
 
-        foreach ( $quotes as $quote )
-        {
+        foreach ($quotes as $quote) {
             $state = "";
             $stateText = "";
-            if ( $quote->state === 'created' ) {
-                if ( $quote->send_state == 1 || $quote->send_state == true )
-                {
+
+            if ($quote->state === 'created') {
+                if (
+                    $quote->send_state == 1 ||
+                    $quote->send_state == true
+                ) {
                     $state = 'send';
-                    $stateText = '<span class="badge bg-warning">Enviado</span>';
+
+                    $stateText =
+                        '<span class="badge bg-warning">' .
+                        'Enviado' .
+                        '</span>';
                 } else {
                     $state = 'created';
-                    $stateText = '<span class="badge bg-primary">Creada</span>';
+
+                    $stateText =
+                        '<span class="badge bg-primary">' .
+                        'Creada' .
+                        '</span>';
                 }
             }
-            if ($quote->state_active === 'close'){
+
+            if ($quote->state_active === 'close') {
                 $state = 'close';
-                $stateText = '<span class="badge bg-danger">Finalizada</span>';
-            } else {
-                if ($quote->state === 'confirmed' && $quote->raise_status === 1){
 
+                $stateText =
+                    '<span class="badge bg-danger">' .
+                    'Finalizada' .
+                    '</span>';
+            } else {
+                if (
+                    $quote->state === 'confirmed' &&
+                    $quote->raise_status === 1
+                ) {
                     $state = 'raise';
-                    $stateText = '<span class="badge bg-success">Elevada</span>';
+
+                    $stateText =
+                        '<span class="badge bg-success">' .
+                        'Elevada' .
+                        '</span>';
                 }
-                if ($quote->state === 'confirmed' && $quote->raise_status === 0){
+
+                if (
+                    $quote->state === 'confirmed' &&
+                    $quote->raise_status === 0
+                ) {
                     $state = 'confirm';
-                    $stateText =  '<span class="badge bg-success">Confirmada</span>';
+
+                    $stateText =
+                        '<span class="badge bg-success">' .
+                        'Confirmada' .
+                        '</span>';
                 }
-                if ($quote->state === 'canceled'){
+
+                if ($quote->state === 'canceled') {
                     $state = 'canceled';
-                    $stateText = '<span class="badge bg-danger">Cancelada</span>';
+
+                    $stateText =
+                        '<span class="badge bg-danger">' .
+                        'Cancelada' .
+                        '</span>';
+                }
+
+                if ($quote->state === 'requote') {
+                    $state = 'requote';
+
+                    $stateText =
+                        '<span class="badge bg-secondary">' .
+                        'Para Recotizar' .
+                        '</span>';
                 }
             }
 
-            $stateDecimals = '';
-            if ( $quote->state_decimals == 1 )
-            {
-                $stateDecimals = '<span class="badge bg-success">Mostrar</span>';
+            /*
+             * Estado de decimales.
+             */
+            if ($quote->state_decimals == 1) {
+                $stateDecimals =
+                    '<span class="badge bg-success">' .
+                    'Mostrar' .
+                    '</span>';
             } else {
-                $stateDecimals = '<span class="badge bg-danger">Ocultar</span>';
+                $stateDecimals =
+                    '<span class="badge bg-danger">' .
+                    'Ocultar' .
+                    '</span>';
             }
 
-            $total_workforce  = 0;
-            foreach($quote->equipments as $equipment)
-            {
-                foreach($equipment->workforces as $workforce)
-                {
-                    if ( $workforce->billable == false )
-                    {
-                        $total_workforce = $total_workforce + $workforce->total;
-                    }
+            /*
+             * Servicios no facturables.
+             */
+            $total_workforce = 0;
 
+            foreach ($quote->equipments as $equipment) {
+                foreach ($equipment->workforces as $workforce) {
+                    if ($workforce->billable == false) {
+                        $total_workforce +=
+                            (float) $workforce->total;
+                    }
                 }
             }
 
-            array_push($array, [
-                "id" => $quote->id,
-                "year" => ( $quote->date_quote == null || $quote->date_quote == "") ? '':$quote->date_quote->year,
-                "code" => ($quote->code == null || $quote->code == "") ? '': $quote->code,
-                "description" => ($quote->description_quote == null || $quote->description_quote == "") ? '': $quote->description_quote,
-                "date_quote" => ($quote->date_quote == null || $quote->date_quote == "") ? '': $quote->date_quote->format('d/m/Y'),
-                "order" => ($quote->code_customer == null || $quote->code_customer == "") ? "": $quote->code_customer,
-                "date_validate" => ($quote->date_validate == null || $quote->date_validate == "") ? '': $quote->date_validate->format('d/m/Y'),
-                "deadline" => ($quote->payment_deadline_id == null || $quote->payment_deadline_id == "") ? "":$quote->deadline->description,
-                "time_delivery" => $quote->time_delivery.' DÍAS',
-                "customer" => empty($quote->customer_id) ? "" : ($quote->customer->business_name ?? ""),
-                "total_sunat" => number_format($quote->total_importe, 2),
-                "total_cliente" => number_format($quote->total_importe+$total_workforce, 2),
-                "total_services" => number_format($total_workforce, 2),
-                "currency" => ($quote->currency_invoice == null || $quote->currency_invoice == "") ? '': $quote->currency_invoice,
-                "state" => $state,
-                "stateText" => $stateText,
-                "created_at" => $quote->created_at->format('d/m/Y'),
-                "creator" => ($quote->users[0] == null) ? "": $quote->users[0]->user->name,
-                "decimals" => $stateDecimals,
-                "send_state" => $quote->send_state
-            ]);
+            $array[] = [
+                'id' => $quote->id,
+
+                'year' => (
+                    $quote->date_quote == null ||
+                    $quote->date_quote == ""
+                )
+                    ? ''
+                    : $quote->date_quote->year,
+
+                'code' => (
+                    $quote->code == null ||
+                    $quote->code == ""
+                )
+                    ? ''
+                    : $quote->code,
+
+                'description' => (
+                    $quote->description_quote == null ||
+                    $quote->description_quote == ""
+                )
+                    ? ''
+                    : $quote->description_quote,
+
+                'date_quote' => (
+                    $quote->date_quote == null ||
+                    $quote->date_quote == ""
+                )
+                    ? ''
+                    : $quote->date_quote->format('d/m/Y'),
+
+                'order' => (
+                    $quote->code_customer == null ||
+                    $quote->code_customer == ""
+                )
+                    ? ''
+                    : $quote->code_customer,
+
+                'date_validate' => (
+                    $quote->date_validate == null ||
+                    $quote->date_validate == ""
+                )
+                    ? ''
+                    : $quote->date_validate->format('d/m/Y'),
+
+                'deadline' => (
+                    $quote->payment_deadline_id == null ||
+                    $quote->payment_deadline_id == ""
+                )
+                    ? ''
+                    : optional($quote->deadline)->description,
+
+                'time_delivery' =>
+                    $quote->time_delivery . ' DÍAS',
+
+                'customer' => empty($quote->customer_id)
+                    ? ''
+                    : optional($quote->customer)->business_name,
+
+                'total_sunat' => number_format(
+                    $quote->total_importe,
+                    2
+                ),
+
+                'total_cliente' => number_format(
+                    $quote->total_importe + $total_workforce,
+                    2
+                ),
+
+                'total_services' => number_format(
+                    $total_workforce,
+                    2
+                ),
+
+                'currency' => (
+                    $quote->currency_invoice == null ||
+                    $quote->currency_invoice == ""
+                )
+                    ? ''
+                    : $quote->currency_invoice,
+
+                'state' => $state,
+                'stateText' => $stateText,
+
+                'created_at' => $quote->created_at
+                    ->format('d/m/Y'),
+
+                'creator' => (
+                    !isset($quote->users[0]) ||
+                    !$quote->users[0]->user
+                )
+                    ? ''
+                    : $quote->users[0]->user->name,
+
+                'decimals' => $stateDecimals,
+                'send_state' => $quote->send_state,
+            ];
         }
 
+        /*
+         * ============================================================
+         * INFORMACIÓN DE PAGINACIÓN
+         * ============================================================
+         */
         $pagination = [
-            'currentPage' => (int)$pageNumber,
-            'totalPages' => (int)$totalPages,
+            'currentPage' => (int) $pageNumber,
+            'totalPages' => $totalPages,
             'startRecord' => $startRecord,
             'endRecord' => $endRecord,
             'totalRecords' => $totalFilteredRecords,
-            'totalFilteredRecords' => $totalFilteredRecords
+            'totalFilteredRecords' => $totalFilteredRecords,
         ];
 
-        return ['data' => $array, 'pagination' => $pagination];
+        return [
+            'data' => $array,
+            'pagination' => $pagination,
+        ];
     }
 
     public function getDataQuotesSalesIndex(Request $request, $pageNumber = 1)
@@ -2311,7 +3300,7 @@ class QuoteSaleController extends Controller
     {
         $begin = microtime(true);
         $validated = $request->validated();
-
+        $reservationService = app(QuoteStockReservationService::class);
         DB::beginTransaction();
         try {
             $quote = Quote::find($request->get('quote_id'));
@@ -6671,53 +7660,221 @@ class QuoteSaleController extends Controller
             $nubefactResult = null;
 
             if ($pagosParcialesVenta === 'n' && in_array($sale->type_document, ['01', '03'])) {
+                /*
+                 * PRIMER PROCESO:
+                 * Emitir el comprobante en Nubefact.
+                 */
                 try {
                     $sale->loadMissing(['details.material']);
-                    $nubefactResult = $this->generarComprobanteNubefactParaVenta($sale);
 
+                    $nubefactResult = $this
+                        ->generarComprobanteNubefactParaVenta($sale);
+
+                    /*
+                     * Guardamos inmediatamente los datos tributarios.
+                     *
+                     * Desde este momento sabemos que Nubefact procesó
+                     * correctamente el comprobante, aunque después pudiera
+                     * fallar la descarga de uno de los archivos.
+                     */
+                    $sale->update([
+                        'serie_sunat' => $nubefactResult['serie'] ?? null,
+                        'numero' => $nubefactResult['numero'] ?? null,
+                        'sunat_ticket' => $nubefactResult['sunat_ticket'] ?? null,
+                        'sunat_status' => $nubefactResult['sunat_description']
+                            ?? 'Enviado',
+                        'sunat_message' => $nubefactResult['sunat_note'] ?? '',
+                        'fecha_emision' => now()->toDateString(),
+                    ]);
+                } catch (\Throwable $e) {
+                    Log::error('Error al generar comprobante en Nubefact', [
+                        'sale_id' => $sale->id,
+                        'error' => $e->getMessage(),
+                    ]);
+
+                    $sale->update([
+                        'sunat_status' => 'Error',
+                        'sunat_message' => $e->getMessage(),
+                    ]);
+                }
+
+                /*
+                 * SEGUNDO PROCESO:
+                 * Descargar PDF, XML y CDR.
+                 *
+                 * Solamente se ejecuta si Nubefact devolvió un resultado.
+                 */
+                if (is_array($nubefactResult)) {
                     $filename = 'ORD' . $sale->id;
+
                     $pdfFilename = $filename . '.pdf';
                     $xmlFilename = $filename . '.xml';
                     $cdrFilename = $filename . '.zip';
 
+                    $pdfPath = public_path(
+                        'comprobantes/pdfs/' . $pdfFilename
+                    );
+
+                    $xmlPath = public_path(
+                        'comprobantes/xmls/' . $xmlFilename
+                    );
+
+                    $cdrPath = public_path(
+                        'comprobantes/cdrs/' . $cdrFilename
+                    );
+
+                    /*
+                     * Creamos las carpetas con permisos estándar.
+                     * Ya no usamos 0777.
+                     */
                     foreach (['pdfs', 'xmls', 'cdrs'] as $folder) {
-                        if (!file_exists(public_path("comprobantes/$folder"))) {
-                            mkdir(public_path("comprobantes/$folder"), 0777, true);
+                        $directory = public_path(
+                            'comprobantes/' . $folder
+                        );
+
+                        if (!is_dir($directory)) {
+                            if (
+                                !mkdir($directory, 0755, true) &&
+                                !is_dir($directory)
+                            ) {
+                                Log::error(
+                                    'No se pudo crear directorio de comprobantes',
+                                    [
+                                        'sale_id' => $sale->id,
+                                        'directory' => $directory,
+                                    ]
+                                );
+                            }
                         }
                     }
 
+                    /*
+                     * Las tres descargas son independientes.
+                     *
+                     * Si falla el PDF, todavía intentamos descargar XML y CDR.
+                     * Si falla el XML, todavía intentamos descargar el CDR.
+                     */
+                    $pdfDescargado = false;
+                    $xmlDescargado = false;
+                    $cdrDescargado = false;
+
+                    $erroresDescarga = [];
+
                     if (!empty($nubefactResult['enlace_del_pdf'])) {
-                        $pdfContent = Http::get($nubefactResult['enlace_del_pdf'])->body();
-                        file_put_contents(public_path('comprobantes/pdfs/' . $pdfFilename), $pdfContent);
+                        try {
+                            $this->descargarArchivoNubefactSeguro(
+                                $nubefactResult['enlace_del_pdf'],
+                                $pdfPath,
+                                'pdf'
+                            );
+
+                            $pdfDescargado = true;
+                        } catch (\Throwable $e) {
+                            $erroresDescarga[] = 'PDF: ' . $e->getMessage();
+
+                            Log::error(
+                                'El comprobante fue emitido, pero falló el PDF',
+                                [
+                                    'sale_id' => $sale->id,
+                                    'error' => $e->getMessage(),
+                                    'url' => $nubefactResult['enlace_del_pdf'],
+                                ]
+                            );
+                        }
                     }
 
                     if (!empty($nubefactResult['enlace_del_xml'])) {
-                        $xmlContent = Http::get($nubefactResult['enlace_del_xml'])->body();
-                        file_put_contents(public_path('comprobantes/xmls/' . $xmlFilename), $xmlContent);
+                        try {
+                            $this->descargarArchivoNubefactSeguro(
+                                $nubefactResult['enlace_del_xml'],
+                                $xmlPath,
+                                'xml'
+                            );
+
+                            $xmlDescargado = true;
+                        } catch (\Throwable $e) {
+                            $erroresDescarga[] = 'XML: ' . $e->getMessage();
+
+                            Log::error(
+                                'El comprobante fue emitido, pero falló el XML',
+                                [
+                                    'sale_id' => $sale->id,
+                                    'error' => $e->getMessage(),
+                                    'url' => $nubefactResult['enlace_del_xml'],
+                                ]
+                            );
+                        }
                     }
 
                     if (!empty($nubefactResult['enlace_del_cdr'])) {
-                        $cdrContent = Http::get($nubefactResult['enlace_del_cdr'])->body();
-                        file_put_contents(public_path('comprobantes/cdrs/' . $cdrFilename), $cdrContent);
+                        try {
+                            $this->descargarArchivoNubefactSeguro(
+                                $nubefactResult['enlace_del_cdr'],
+                                $cdrPath,
+                                'zip'
+                            );
+
+                            $cdrDescargado = true;
+                        } catch (\Throwable $e) {
+                            $erroresDescarga[] = 'CDR: ' . $e->getMessage();
+
+                            Log::error(
+                                'El comprobante fue emitido, pero falló el CDR',
+                                [
+                                    'sale_id' => $sale->id,
+                                    'error' => $e->getMessage(),
+                                    'url' => $nubefactResult['enlace_del_cdr'],
+                                ]
+                            );
+                        }
                     }
 
-                    $sale->update([
-                        'serie_sunat'   => $nubefactResult['serie'] ?? null,
-                        'numero'        => $nubefactResult['numero'] ?? null,
-                        'sunat_ticket'  => $nubefactResult['sunat_ticket'] ?? null,
-                        'sunat_status'  => $nubefactResult['sunat_description'] ?? 'Enviado',
-                        'sunat_message' => $nubefactResult['sunat_note'] ?? '',
-                        'xml_path'      => file_exists(public_path('comprobantes/xmls/' . $xmlFilename)) ? $xmlFilename : null,
-                        'cdr_path'      => file_exists(public_path('comprobantes/cdrs/' . $cdrFilename)) ? $cdrFilename : null,
-                        'pdf_path'      => file_exists(public_path('comprobantes/pdfs/' . $pdfFilename)) ? $pdfFilename : null,
-                        'fecha_emision' => now()->toDateString(),
-                    ]);
+                    /*
+                     * Solo guardamos las rutas cuando la descarga y validación
+                     * fueron correctas.
+                     *
+                     * Ya no usamos únicamente file_exists(), porque un HTML
+                     * también podría existir con extensión .pdf.
+                     */
+                    $datosArchivos = [];
 
-                } catch (\Throwable $e) {
-                    $sale->update([
-                        'sunat_status'  => 'Error',
-                        'sunat_message' => $e->getMessage(),
-                    ]);
+                    if ($pdfDescargado) {
+                        $datosArchivos['pdf_path'] = $pdfFilename;
+                    }
+
+                    if ($xmlDescargado) {
+                        $datosArchivos['xml_path'] = $xmlFilename;
+                    }
+
+                    if ($cdrDescargado) {
+                        $datosArchivos['cdr_path'] = $cdrFilename;
+                    }
+
+                    if (!empty($datosArchivos)) {
+                        $sale->update($datosArchivos);
+                    }
+
+                    /*
+                     * No cambiamos sunat_status a Error, porque el comprobante
+                     * sí fue emitido.
+                     *
+                     * El detalle técnico queda en laravel.log.
+                     */
+                    if (!empty($erroresDescarga)) {
+                        Log::warning(
+                            'Comprobante emitido con archivos pendientes',
+                            [
+                                'sale_id' => $sale->id,
+                                'errores' => $erroresDescarga,
+                            ]
+                        );
+                    }
+
+                    /*
+                     * Recargamos el modelo porque acabamos de actualizar
+                     * pdf_path, xml_path y cdr_path.
+                     */
+                    $sale->refresh();
                 }
             }
 
@@ -6725,20 +7882,30 @@ class QuoteSaleController extends Controller
             $printType = 'ticket';
 
             if ($pagosParcialesVenta === 'n' && in_array($sale->type_document, ['01', '03'])) {
-                if (!empty($nubefactResult['enlace_del_pdf'])) {
-                    $urlPrint = $nubefactResult['enlace_del_pdf'];
-                }
-
                 if (!empty($sale->pdf_path)) {
-                    $localPath = public_path('comprobantes/pdfs/' . $sale->pdf_path);
+                    $localPath = public_path(
+                        'comprobantes/pdfs/' . $sale->pdf_path
+                    );
 
                     if (file_exists($localPath)) {
-                        $urlPrint  = asset('comprobantes/pdfs/' . $sale->pdf_path);
-                        $printType = 'sunat_pdf';
-                    } elseif (!empty($nubefactResult['enlace_del_pdf'])) {
-                        $urlPrint  = $nubefactResult['enlace_del_pdf'];
+                        $urlPrint = asset(
+                            'comprobantes/pdfs/' . $sale->pdf_path
+                        );
+
                         $printType = 'sunat_pdf';
                     }
+                }
+
+                /*
+                 * Si el archivo local no se pudo descargar,
+                 * utilizamos directamente el enlace de Nubefact.
+                 */
+                if (
+                    $printType !== 'sunat_pdf' &&
+                    !empty($nubefactResult['enlace_del_pdf'])
+                ) {
+                    $urlPrint = $nubefactResult['enlace_del_pdf'];
+                    $printType = 'sunat_pdf';
                 }
             }
 

@@ -532,6 +532,17 @@
 
     <template id="template-active">
         <a href="" target="_blank" data-print_recibo data-id="" class="btn btn-outline-dark btn-sm" data-toggle="tooltip" data-placement="top" title="Imprimir boleta"><i class="fas fa-print"></i></a>
+
+        <button type="button"
+                data-recuperar_archivos_nubefact
+                data-sale_id=""
+                class="btn btn-outline-primary btn-sm"
+                data-toggle="tooltip"
+                data-placement="top"
+                title="Recuperar archivos del comprobante">
+            <i class="fas fa-sync-alt"></i>
+        </button>
+
         <button data-ver_detalles data-id="" class="btn btn-outline-secondary btn-sm" data-toggle="tooltip" data-placement="top" title="Ver Detalles"><i class="fas fa-list-ol"></i></button>
         <button data-anular data-id="" data-type_document="" class="btn btn-outline-danger btn-sm" data-toggle="tooltip" data-placement="top" title="Anular Orden"><i class="fas fa-trash-alt"></i></button>
 

@@ -2969,6 +2969,15 @@ Route::middleware(['auth', 'check.user.enabled'])->group(function (){
         Route::get('/quotes/stock-items/{stockItemId}/available-items', 'QuoteSaleController@getAvailableItemsByStockItem')
             ->name('quotes.stock-items.available-items');
 
+        /*Route::post('/renew/quote/sale/{quote}', 'QuoteSaleController@renewQuote')
+            ->middleware('permission:renew_quote');*/
+        Route::post(
+            'cotizaciones/venta/{quote}/recotizar',
+            'QuoteSaleController@renewQuote'
+        )
+            ->name('quoteSale.renew')
+            ->middleware('permission:renew_quoteSale');
+
         // TODO: PromotionLimits
         Route::get('promociones/por/limite', 'PromotionLimitController@index')
             ->name('promotionLimit.index')
@@ -3247,6 +3256,19 @@ Route::middleware(['auth', 'check.user.enabled'])->group(function (){
                 'FreeSaleController@generateInvoice'
             )->name('freeSale.generateInvoice');
         });
+
+        Route::post(
+            '/ventas/{sale}/recuperar-archivos-nubefact',
+            'PuntoVentaController@recuperarArchivosNubefact'
+        )->name('puntoVenta.recuperarArchivosNubefact');
+
+        if (app()->environment('local')) {
+            Route::get(
+                '/punto-venta/probar-consulta-nubefact/{saleId}',
+                'PuntoVentaController@probarConsultaComprobanteNubefact'
+            );
+        }
+
     });
 });
 

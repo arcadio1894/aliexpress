@@ -38,7 +38,7 @@ $(document).ready(function () {
 
     $(document).on('click', '[data-send]', sendQuote);
 
-    $(document).on('click', '[data-renew]', renewQuote);
+    /*$(document).on('click', '[data-renew]', renewQuote);*/
 
     $('#btn-export').on('click', exportQuotes);
 
@@ -62,6 +62,176 @@ $(document).ready(function () {
     $(document).on('click', '[data-active_quote]', activeQuote);
 
     $('#btn-download').on('click', downloadQuotes);
+
+    $(document).on('click', '[data-recotizar]', function () {
+        const $button = $(this);
+
+        const quoteId = parseInt(
+            $button.attr('data-renew') || 0
+        );
+
+        const quoteName = $.trim(
+            $button.attr('data-name') || ''
+        );
+
+        if (!quoteId) {
+            $.alert({
+                title: 'Aviso',
+                content: 'No se pudo identificar la cotización.',
+                type: 'orange',
+                buttons: {
+                    ok: {
+                        text: 'Aceptar',
+                        btnClass: 'btn-warning'
+                    }
+                }
+            });
+
+            return;
+        }
+
+        const description = quoteName !== ''
+            ? '<br><br><strong>' +
+            $('<div>').text(quoteName).html() +
+            '</strong>'
+            : '';
+
+        $.confirm({
+            icon: 'fas fa-sync',
+            theme: 'modern',
+            animation: 'zoom',
+            closeAnimation: 'scale',
+            closeIcon: true,
+            type: 'green',
+
+            title: 'Recotizar cotización',
+
+            content:
+                '¿Está seguro de generar una nueva cotización a partir de esta cotización?' +
+                description +
+                '<br><br>' +
+                'Los precios y el stock serán validados nuevamente.',
+
+            buttons: {
+                confirm: {
+                    text: 'RECOTIZAR',
+                    btnClass: 'btn-success',
+
+                    action: function () {
+                        const confirmInstance = this;
+
+                        /*
+                         * Evitar múltiples clics.
+                         */
+                        $button.prop('disabled', true);
+
+                        confirmInstance.buttons.confirm.disable();
+                        confirmInstance.buttons.cancel.disable();
+
+                        confirmInstance.setContent(
+                            '<div class="text-center">' +
+                            '<i class="fas fa-spinner fa-spin fa-2x"></i>' +
+                            '<br><br>' +
+                            'Recotizando, por favor espere...' +
+                            '</div>'
+                        );
+
+                        $.ajax({
+                            url:
+                                document.location.origin +
+                                '/dashboard/cotizaciones/venta/' +
+                                quoteId +
+                                '/recotizar',
+
+                            method: 'POST',
+
+                            headers: {
+                                'X-CSRF-TOKEN': $(
+                                    'meta[name="csrf-token"]'
+                                ).attr('content')
+                            },
+
+                            success: function (response) {
+                                confirmInstance.close();
+
+                                $.alert({
+                                    icon: 'fas fa-check-circle',
+                                    theme: 'modern',
+                                    animation: 'zoom',
+                                    type: 'green',
+
+                                    title: 'Cotización recotizada',
+
+                                    content:
+                                        response.message ||
+                                        'La nueva cotización fue creada correctamente.',
+
+                                    buttons: {
+                                        ok: {
+                                            text: 'Aceptar',
+                                            btnClass: 'btn-success',
+
+                                            action: function () {
+                                                window.location.href =
+                                                    response.url;
+                                            }
+                                        }
+                                    }
+                                });
+                            },
+
+                            error: function (xhr) {
+                                $button.prop('disabled', false);
+
+                                confirmInstance.close();
+
+                                let message =
+                                    'Sucedió un error al recotizar la cotización.';
+
+                                if (
+                                    xhr.responseJSON &&
+                                    xhr.responseJSON.message
+                                ) {
+                                    message =
+                                        xhr.responseJSON.message;
+                                }
+
+                                $.alert({
+                                    icon: 'fas fa-exclamation-triangle',
+                                    theme: 'modern',
+                                    animation: 'zoom',
+                                    type: 'orange',
+
+                                    title: 'No se pudo recotizar',
+
+                                    content: $('<div>')
+                                        .text(message)
+                                        .html(),
+
+                                    buttons: {
+                                        ok: {
+                                            text: 'Aceptar',
+                                            btnClass: 'btn-warning'
+                                        }
+                                    }
+                                });
+                            }
+                        });
+
+                        /*
+                         * Mantiene abierto jquery-confirm mientras
+                         * finaliza el AJAX.
+                         */
+                        return false;
+                    }
+                },
+
+                cancel: {
+                    text: 'CANCELAR'
+                }
+            }
+        });
+    });
 });
 
 var $formDelete;
@@ -2181,34 +2351,31 @@ function renderDataTable(data) {
         botones.append(cloneBtnClose);
     }
 
-    if ( data.state == "canceled" ) {
-        var cloneBtnCanceled = activateTemplate('#template-btn_canceled');
+    if ( data.state == "requote" ) {
+        var cloneBtnRequote = activateTemplate('#template-btn_requote');
 
         if ( $.inArray('show_quote', $permissions) !== -1 ) {
             let url = document.location.origin+ '/dashboard/ver/cotizacion/venta/'+data.id;
-            cloneBtnCanceled.querySelector("[data-ver_cotizacion]").setAttribute("href", url);
+            cloneBtnRequote.querySelector("[data-ver_cotizacion]").setAttribute("href", url);
         } else {
-            let element = cloneBtnCanceled.querySelector("[data-ver_cotizacion]");
+            let element = cloneBtnRequote.querySelector("[data-ver_cotizacion]");
             if (element) {
                 element.style.display = 'none';
             }
         }
 
-        /*if ( $.inArray('renew_quote', $permissions) !== -1 ) {
-            cloneBtnCanceled.querySelector("[data-recotizar]").setAttribute("data-renew", data.id);
-            cloneBtnCanceled.querySelector("[data-recotizar]").setAttribute("data-name", data.description);
+        if ( $.inArray('renew_quoteSale', $permissions) !== -1 ) {
+            cloneBtnRequote.querySelector("[data-recotizar]").setAttribute("data-renew", data.id);
+            cloneBtnRequote.querySelector("[data-recotizar]").setAttribute("data-name", data.description);
         } else {
-            let element = cloneBtnCanceled.querySelector("[data-recotizar]");
+            let element = cloneBtnRequote.querySelector("[data-recotizar]");
             if (element) {
                 element.style.display = 'none';
             }
-        }*/
+        }
 
-        botones.append(cloneBtnCanceled);
+        botones.append(cloneBtnRequote);
     }
-
-    /*clone.querySelector("[data-formEditFacturacion]").setAttribute('data-formEditFacturacion', data.id);
-    clone.querySelector("[data-formEditFacturacion]").setAttribute('data-type', data.type);*/
 
     $("#body-table").append(clone);
 

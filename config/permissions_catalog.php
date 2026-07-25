@@ -382,6 +382,7 @@ return [
     'regularize_orderService' => 'Regularizar órdenes de servicio',
     'relationship_worker' => 'Configurar parentescos',
     'renew_quote' => 'Renovar Cotizaciones',
+    'renew_quoteSale' => 'Renovar Cotizaciones Venta',
     'replacement_quote' => 'Reemplazar materiales en cotización',
     'reportMaterialEntries_entryPurchase' => 'Reporte Materiales en Ingresos',
     'report_assistance' => 'Reporte asistencias',
