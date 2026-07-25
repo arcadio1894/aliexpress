@@ -56,6 +56,7 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Barryvdh\DomPDF\Facade as PDF;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
@@ -7659,53 +7660,221 @@ class QuoteSaleController extends Controller
             $nubefactResult = null;
 
             if ($pagosParcialesVenta === 'n' && in_array($sale->type_document, ['01', '03'])) {
+                /*
+                 * PRIMER PROCESO:
+                 * Emitir el comprobante en Nubefact.
+                 */
                 try {
                     $sale->loadMissing(['details.material']);
-                    $nubefactResult = $this->generarComprobanteNubefactParaVenta($sale);
 
+                    $nubefactResult = $this
+                        ->generarComprobanteNubefactParaVenta($sale);
+
+                    /*
+                     * Guardamos inmediatamente los datos tributarios.
+                     *
+                     * Desde este momento sabemos que Nubefact procesó
+                     * correctamente el comprobante, aunque después pudiera
+                     * fallar la descarga de uno de los archivos.
+                     */
+                    $sale->update([
+                        'serie_sunat' => $nubefactResult['serie'] ?? null,
+                        'numero' => $nubefactResult['numero'] ?? null,
+                        'sunat_ticket' => $nubefactResult['sunat_ticket'] ?? null,
+                        'sunat_status' => $nubefactResult['sunat_description']
+                            ?? 'Enviado',
+                        'sunat_message' => $nubefactResult['sunat_note'] ?? '',
+                        'fecha_emision' => now()->toDateString(),
+                    ]);
+                } catch (\Throwable $e) {
+                    Log::error('Error al generar comprobante en Nubefact', [
+                        'sale_id' => $sale->id,
+                        'error' => $e->getMessage(),
+                    ]);
+
+                    $sale->update([
+                        'sunat_status' => 'Error',
+                        'sunat_message' => $e->getMessage(),
+                    ]);
+                }
+
+                /*
+                 * SEGUNDO PROCESO:
+                 * Descargar PDF, XML y CDR.
+                 *
+                 * Solamente se ejecuta si Nubefact devolvió un resultado.
+                 */
+                if (is_array($nubefactResult)) {
                     $filename = 'ORD' . $sale->id;
+
                     $pdfFilename = $filename . '.pdf';
                     $xmlFilename = $filename . '.xml';
                     $cdrFilename = $filename . '.zip';
 
+                    $pdfPath = public_path(
+                        'comprobantes/pdfs/' . $pdfFilename
+                    );
+
+                    $xmlPath = public_path(
+                        'comprobantes/xmls/' . $xmlFilename
+                    );
+
+                    $cdrPath = public_path(
+                        'comprobantes/cdrs/' . $cdrFilename
+                    );
+
+                    /*
+                     * Creamos las carpetas con permisos estándar.
+                     * Ya no usamos 0777.
+                     */
                     foreach (['pdfs', 'xmls', 'cdrs'] as $folder) {
-                        if (!file_exists(public_path("comprobantes/$folder"))) {
-                            mkdir(public_path("comprobantes/$folder"), 0777, true);
+                        $directory = public_path(
+                            'comprobantes/' . $folder
+                        );
+
+                        if (!is_dir($directory)) {
+                            if (
+                                !mkdir($directory, 0755, true) &&
+                                !is_dir($directory)
+                            ) {
+                                Log::error(
+                                    'No se pudo crear directorio de comprobantes',
+                                    [
+                                        'sale_id' => $sale->id,
+                                        'directory' => $directory,
+                                    ]
+                                );
+                            }
                         }
                     }
 
+                    /*
+                     * Las tres descargas son independientes.
+                     *
+                     * Si falla el PDF, todavía intentamos descargar XML y CDR.
+                     * Si falla el XML, todavía intentamos descargar el CDR.
+                     */
+                    $pdfDescargado = false;
+                    $xmlDescargado = false;
+                    $cdrDescargado = false;
+
+                    $erroresDescarga = [];
+
                     if (!empty($nubefactResult['enlace_del_pdf'])) {
-                        $pdfContent = Http::get($nubefactResult['enlace_del_pdf'])->body();
-                        file_put_contents(public_path('comprobantes/pdfs/' . $pdfFilename), $pdfContent);
+                        try {
+                            $this->descargarArchivoNubefactSeguro(
+                                $nubefactResult['enlace_del_pdf'],
+                                $pdfPath,
+                                'pdf'
+                            );
+
+                            $pdfDescargado = true;
+                        } catch (\Throwable $e) {
+                            $erroresDescarga[] = 'PDF: ' . $e->getMessage();
+
+                            Log::error(
+                                'El comprobante fue emitido, pero falló el PDF',
+                                [
+                                    'sale_id' => $sale->id,
+                                    'error' => $e->getMessage(),
+                                    'url' => $nubefactResult['enlace_del_pdf'],
+                                ]
+                            );
+                        }
                     }
 
                     if (!empty($nubefactResult['enlace_del_xml'])) {
-                        $xmlContent = Http::get($nubefactResult['enlace_del_xml'])->body();
-                        file_put_contents(public_path('comprobantes/xmls/' . $xmlFilename), $xmlContent);
+                        try {
+                            $this->descargarArchivoNubefactSeguro(
+                                $nubefactResult['enlace_del_xml'],
+                                $xmlPath,
+                                'xml'
+                            );
+
+                            $xmlDescargado = true;
+                        } catch (\Throwable $e) {
+                            $erroresDescarga[] = 'XML: ' . $e->getMessage();
+
+                            Log::error(
+                                'El comprobante fue emitido, pero falló el XML',
+                                [
+                                    'sale_id' => $sale->id,
+                                    'error' => $e->getMessage(),
+                                    'url' => $nubefactResult['enlace_del_xml'],
+                                ]
+                            );
+                        }
                     }
 
                     if (!empty($nubefactResult['enlace_del_cdr'])) {
-                        $cdrContent = Http::get($nubefactResult['enlace_del_cdr'])->body();
-                        file_put_contents(public_path('comprobantes/cdrs/' . $cdrFilename), $cdrContent);
+                        try {
+                            $this->descargarArchivoNubefactSeguro(
+                                $nubefactResult['enlace_del_cdr'],
+                                $cdrPath,
+                                'zip'
+                            );
+
+                            $cdrDescargado = true;
+                        } catch (\Throwable $e) {
+                            $erroresDescarga[] = 'CDR: ' . $e->getMessage();
+
+                            Log::error(
+                                'El comprobante fue emitido, pero falló el CDR',
+                                [
+                                    'sale_id' => $sale->id,
+                                    'error' => $e->getMessage(),
+                                    'url' => $nubefactResult['enlace_del_cdr'],
+                                ]
+                            );
+                        }
                     }
 
-                    $sale->update([
-                        'serie_sunat'   => $nubefactResult['serie'] ?? null,
-                        'numero'        => $nubefactResult['numero'] ?? null,
-                        'sunat_ticket'  => $nubefactResult['sunat_ticket'] ?? null,
-                        'sunat_status'  => $nubefactResult['sunat_description'] ?? 'Enviado',
-                        'sunat_message' => $nubefactResult['sunat_note'] ?? '',
-                        'xml_path'      => file_exists(public_path('comprobantes/xmls/' . $xmlFilename)) ? $xmlFilename : null,
-                        'cdr_path'      => file_exists(public_path('comprobantes/cdrs/' . $cdrFilename)) ? $cdrFilename : null,
-                        'pdf_path'      => file_exists(public_path('comprobantes/pdfs/' . $pdfFilename)) ? $pdfFilename : null,
-                        'fecha_emision' => now()->toDateString(),
-                    ]);
+                    /*
+                     * Solo guardamos las rutas cuando la descarga y validación
+                     * fueron correctas.
+                     *
+                     * Ya no usamos únicamente file_exists(), porque un HTML
+                     * también podría existir con extensión .pdf.
+                     */
+                    $datosArchivos = [];
 
-                } catch (\Throwable $e) {
-                    $sale->update([
-                        'sunat_status'  => 'Error',
-                        'sunat_message' => $e->getMessage(),
-                    ]);
+                    if ($pdfDescargado) {
+                        $datosArchivos['pdf_path'] = $pdfFilename;
+                    }
+
+                    if ($xmlDescargado) {
+                        $datosArchivos['xml_path'] = $xmlFilename;
+                    }
+
+                    if ($cdrDescargado) {
+                        $datosArchivos['cdr_path'] = $cdrFilename;
+                    }
+
+                    if (!empty($datosArchivos)) {
+                        $sale->update($datosArchivos);
+                    }
+
+                    /*
+                     * No cambiamos sunat_status a Error, porque el comprobante
+                     * sí fue emitido.
+                     *
+                     * El detalle técnico queda en laravel.log.
+                     */
+                    if (!empty($erroresDescarga)) {
+                        Log::warning(
+                            'Comprobante emitido con archivos pendientes',
+                            [
+                                'sale_id' => $sale->id,
+                                'errores' => $erroresDescarga,
+                            ]
+                        );
+                    }
+
+                    /*
+                     * Recargamos el modelo porque acabamos de actualizar
+                     * pdf_path, xml_path y cdr_path.
+                     */
+                    $sale->refresh();
                 }
             }
 
@@ -7713,20 +7882,30 @@ class QuoteSaleController extends Controller
             $printType = 'ticket';
 
             if ($pagosParcialesVenta === 'n' && in_array($sale->type_document, ['01', '03'])) {
-                if (!empty($nubefactResult['enlace_del_pdf'])) {
-                    $urlPrint = $nubefactResult['enlace_del_pdf'];
-                }
-
                 if (!empty($sale->pdf_path)) {
-                    $localPath = public_path('comprobantes/pdfs/' . $sale->pdf_path);
+                    $localPath = public_path(
+                        'comprobantes/pdfs/' . $sale->pdf_path
+                    );
 
                     if (file_exists($localPath)) {
-                        $urlPrint  = asset('comprobantes/pdfs/' . $sale->pdf_path);
-                        $printType = 'sunat_pdf';
-                    } elseif (!empty($nubefactResult['enlace_del_pdf'])) {
-                        $urlPrint  = $nubefactResult['enlace_del_pdf'];
+                        $urlPrint = asset(
+                            'comprobantes/pdfs/' . $sale->pdf_path
+                        );
+
                         $printType = 'sunat_pdf';
                     }
+                }
+
+                /*
+                 * Si el archivo local no se pudo descargar,
+                 * utilizamos directamente el enlace de Nubefact.
+                 */
+                if (
+                    $printType !== 'sunat_pdf' &&
+                    !empty($nubefactResult['enlace_del_pdf'])
+                ) {
+                    $urlPrint = $nubefactResult['enlace_del_pdf'];
+                    $printType = 'sunat_pdf';
                 }
             }
 

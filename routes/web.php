@@ -3231,6 +3231,18 @@ Route::middleware(['auth', 'check.user.enabled'])->group(function (){
         Route::post('configuracion/usuarios/web/{id}/cambiar-estado', 'ConfigUserWebController@changeStatus')
             ->name('configUserWeb.changeStatus')
             ->middleware('permission:changeStatusUser_configUserWeb');
+
+        Route::post(
+            '/ventas/{sale}/recuperar-archivos-nubefact',
+            'PuntoVentaController@recuperarArchivosNubefact'
+        )->name('puntoVenta.recuperarArchivosNubefact');
+
+        if (app()->environment('local')) {
+            Route::get(
+                '/punto-venta/probar-consulta-nubefact/{saleId}',
+                'PuntoVentaController@probarConsultaComprobanteNubefact'
+            );
+        }
     });
 });
 

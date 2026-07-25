@@ -1594,6 +1594,25 @@ function guardarVenta() {
                         data.email = $('#email_invoice_factura').val();
                     }
 
+                    var processingDialog = $.dialog({
+                        title: false,
+                        content:
+                            '<div class="text-center py-4">' +
+                            '<div class="spinner-border text-primary mb-3" role="status">' +
+                            '<span class="sr-only">Procesando...</span>' +
+                            '</div>' +
+                            '<h5 class="mb-2">Estamos procesando la venta</h5>' +
+                            '<p class="text-muted mb-0">' +
+                            'Por favor, espere mientras registramos el pago y generamos el comprobante.' +
+                            '</p>' +
+                            '</div>',
+                        columnClass: 'col-md-5 col-md-offset-4',
+                        containerFluid: true,
+                        backgroundDismiss: false,
+                        closeIcon: false,
+                        escapeKey: false
+                    });
+
                     $.ajax({
                         url: createUrl,
                         method: 'POST',
@@ -1636,6 +1655,11 @@ function guardarVenta() {
                                 toastr.error(data.responseJSON.errors[property], 'Error');
                             }
                             $("#btn-pay").attr("disabled", false);
+                        },
+                        complete: function () {
+                            if (processingDialog) {
+                                processingDialog.close();
+                            }
                         }
                     });
                 }

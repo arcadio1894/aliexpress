@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Traits;
 use App\CreditNote;
 use App\Sale;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 trait NubefactTrait
@@ -207,7 +208,7 @@ trait NubefactTrait
         return number_format(round((float)$value, 10, PHP_ROUND_HALF_UP), 10, '.', '');
     }
 
-    private function generarComprobanteNubefactParaVenta(Sale $order): array
+    private function generarComprobanteNubefactParaVentaO(Sale $order): array
     {
         if (!$order->type_document) {
             throw new \Exception('El tipo de comprobante no está definido.');
@@ -246,7 +247,98 @@ trait NubefactTrait
         return $result;
     }
 
-    private function persistNubefactFilesAndUpdateSale(Sale $order, array $result): void
+    private function generarComprobanteNubefactParaVenta(Sale $order): array
+    {
+        if (!$order->type_document) {
+            throw new \RuntimeException(
+                'El tipo de comprobante no está definido.'
+            );
+        }
+
+        $data = $this->buildNubefactData($order);
+
+        $token = config('services.nubefact.token');
+        $url = config('services.nubefact.url');
+
+        if (empty($token) || empty($url)) {
+            throw new \RuntimeException(
+                'Faltan las credenciales de Nubefact.'
+            );
+        }
+
+        try {
+            $response = Http::withHeaders([
+                'Authorization' => 'Token token=' . $token,
+                'Accept' => 'application/json',
+                'Content-Type' => 'application/json',
+            ])
+                /*->connectTimeout(15)*/
+                ->timeout(60)
+                ->post($url, $data);
+        } catch (\Throwable $e) {
+            Log::error('No se pudo conectar con Nubefact', [
+                'sale_id' => $order->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            throw new \RuntimeException(
+                'No se pudo establecer conexión con Nubefact: '
+                . $e->getMessage()
+            );
+        }
+
+        $result = $response->json();
+
+        if (!$response->successful()) {
+            $mensaje = is_array($result)
+                ? json_encode($result, JSON_UNESCAPED_UNICODE)
+                : substr($response->body(), 0, 1000);
+
+            Log::error('Nubefact respondió con error HTTP', [
+                'sale_id' => $order->id,
+                'http_status' => $response->status(),
+                'content_type' => $response->header('Content-Type'),
+                'response' => $mensaje,
+            ]);
+
+            throw new \RuntimeException(
+                'Nubefact respondió con HTTP '
+                . $response->status()
+                . ': '
+                . $mensaje
+            );
+        }
+
+        if (!is_array($result)) {
+            Log::error('Nubefact no devolvió un JSON válido', [
+                'sale_id' => $order->id,
+                'http_status' => $response->status(),
+                'content_type' => $response->header('Content-Type'),
+                'response' => substr($response->body(), 0, 1000),
+            ]);
+
+            throw new \RuntimeException(
+                'Nubefact devolvió una respuesta inválida.'
+            );
+        }
+
+        if (!empty($result['errors'])) {
+            $errores = is_array($result['errors'])
+                ? json_encode(
+                    $result['errors'],
+                    JSON_UNESCAPED_UNICODE
+                )
+                : (string) $result['errors'];
+
+            throw new \RuntimeException(
+                'Error desde Nubefact: ' . $errores
+            );
+        }
+
+        return $result;
+    }
+
+    private function persistNubefactFilesAndUpdateSaleO(Sale $order, array $result): void
     {
         $filename = 'ORD' . $order->id;
 
@@ -289,6 +381,175 @@ trait NubefactTrait
             'pdf_path'      => file_exists(public_path('comprobantes/pdfs/' . $pdfFilename)) ? $pdfFilename : null,
             'fecha_emision' => now()->toDateString(),
         ]);
+    }
+
+    private function persistNubefactFilesAndUpdateSale(Sale $order, array $result): array {
+        $filename = 'ORD' . $order->id;
+
+        $pdfFilename = $filename . '.pdf';
+        $xmlFilename = $filename . '.xml';
+        $cdrFilename = $filename . '.zip';
+
+        $pdfDirectory = public_path('comprobantes/pdfs');
+        $xmlDirectory = public_path('comprobantes/xmls');
+        $cdrDirectory = public_path('comprobantes/cdrs');
+
+        /*
+         * Crear las carpetas necesarias.
+         * Se utiliza 0755 en lugar de 0777.
+         */
+        foreach (
+            [
+                $pdfDirectory,
+                $xmlDirectory,
+                $cdrDirectory,
+            ] as $directory
+        ) {
+            if (!is_dir($directory)) {
+                if (
+                    !mkdir($directory, 0755, true) &&
+                    !is_dir($directory)
+                ) {
+                    throw new \RuntimeException(
+                        'No se pudo crear el directorio: ' . $directory
+                    );
+                }
+            }
+        }
+
+        $pdfPath = $pdfDirectory
+            . DIRECTORY_SEPARATOR
+            . $pdfFilename;
+
+        $xmlPath = $xmlDirectory
+            . DIRECTORY_SEPARATOR
+            . $xmlFilename;
+
+        $cdrPath = $cdrDirectory
+            . DIRECTORY_SEPARATOR
+            . $cdrFilename;
+
+        $resultado = [
+            'pdf_descargado' => false,
+            'xml_descargado' => false,
+            'cdr_descargado' => false,
+            'errores' => [],
+        ];
+
+        /*
+         * Descargar PDF.
+         */
+        if (!empty($result['enlace_del_pdf'])) {
+            try {
+                $this->descargarArchivoNubefactSeguro(
+                    $result['enlace_del_pdf'],
+                    $pdfPath,
+                    'pdf'
+                );
+
+                $resultado['pdf_descargado'] = true;
+            } catch (\Throwable $e) {
+                $resultado['errores'][] =
+                    'PDF: ' . $e->getMessage();
+
+                Log::error(
+                    'Comprobante emitido, pero falló la descarga del PDF',
+                    [
+                        'sale_id' => $order->id,
+                        'url' => $result['enlace_del_pdf'],
+                        'error' => $e->getMessage(),
+                    ]
+                );
+            }
+        } else {
+            $resultado['errores'][] =
+                'Nubefact no devolvió enlace del PDF.';
+
+            Log::warning(
+                'Nubefact no devolvió enlace del PDF',
+                [
+                    'sale_id' => $order->id,
+                ]
+            );
+        }
+
+        /*
+         * Descargar XML.
+         */
+        if (!empty($result['enlace_del_xml'])) {
+            try {
+                $this->descargarArchivoNubefactSeguro(
+                    $result['enlace_del_xml'],
+                    $xmlPath,
+                    'xml'
+                );
+
+                $resultado['xml_descargado'] = true;
+            } catch (\Throwable $e) {
+                $resultado['errores'][] =
+                    'XML: ' . $e->getMessage();
+
+                Log::error(
+                    'Comprobante emitido, pero falló la descarga del XML',
+                    [
+                        'sale_id' => $order->id,
+                        'url' => $result['enlace_del_xml'],
+                        'error' => $e->getMessage(),
+                    ]
+                );
+            }
+        }
+
+        /*
+         * Descargar CDR.
+         */
+        if (!empty($result['enlace_del_cdr'])) {
+            try {
+                $this->descargarArchivoNubefactSeguro(
+                    $result['enlace_del_cdr'],
+                    $cdrPath,
+                    'zip'
+                );
+
+                $resultado['cdr_descargado'] = true;
+            } catch (\Throwable $e) {
+                $resultado['errores'][] =
+                    'CDR: ' . $e->getMessage();
+
+                Log::error(
+                    'Comprobante emitido, pero falló la descarga del CDR',
+                    [
+                        'sale_id' => $order->id,
+                        'url' => $result['enlace_del_cdr'],
+                        'error' => $e->getMessage(),
+                    ]
+                );
+            }
+        }
+
+        /*
+         * Registrar únicamente los archivos que fueron descargados
+         * y validados correctamente.
+         */
+        $archivosActualizar = [];
+
+        if ($resultado['pdf_descargado']) {
+            $archivosActualizar['pdf_path'] = $pdfFilename;
+        }
+
+        if ($resultado['xml_descargado']) {
+            $archivosActualizar['xml_path'] = $xmlFilename;
+        }
+
+        if ($resultado['cdr_descargado']) {
+            $archivosActualizar['cdr_path'] = $cdrFilename;
+        }
+
+        if (!empty($archivosActualizar)) {
+            $order->update($archivosActualizar);
+        }
+
+        return $resultado;
     }
 
     private function buildNubefactVoidData(Sale $sale, string $motivo): array
@@ -827,5 +1088,330 @@ trait NubefactTrait
 
             "items" => $items,
         ];
+    }
+
+    private function descargarArchivoNubefactSeguro(string $url,string $rutaDestino,string $tipoArchivo,int $maxIntentos = 3): void {
+        $ultimoError = 'Nubefact devolvió una respuesta inválida.';
+
+        for ($intento = 1; $intento <= $maxIntentos; $intento++) {
+            try {
+                $response = Http::timeout(60)
+                    ->get($url);
+
+                $contenido = $response->body();
+
+                if (
+                    $response->successful() &&
+                    $this->contenidoNubefactEsValido(
+                        $contenido,
+                        $tipoArchivo,
+                        $response->header('Content-Type')
+                    )
+                ) {
+                    $directorio = dirname($rutaDestino);
+
+                    if (!is_dir($directorio)) {
+                        if (!mkdir($directorio, 0755, true) && !is_dir($directorio)) {
+                            throw new \RuntimeException(
+                                'No se pudo crear el directorio: ' . $directorio
+                            );
+                        }
+                    }
+
+                    /*
+                     * Primero se escribe en un archivo temporal.
+                     * De esta forma nunca sobrescribimos un archivo válido
+                     * con una respuesta incompleta o incorrecta.
+                     */
+                    $rutaTemporal = $rutaDestino . '.tmp';
+
+                    if (file_exists($rutaTemporal)) {
+                        @unlink($rutaTemporal);
+                    }
+
+                    $bytesEscritos = file_put_contents(
+                        $rutaTemporal,
+                        $contenido,
+                        LOCK_EX
+                    );
+
+                    if ($bytesEscritos === false || $bytesEscritos === 0) {
+                        @unlink($rutaTemporal);
+
+                        throw new \RuntimeException(
+                            'No se pudo escribir el archivo temporal.'
+                        );
+                    }
+
+                    if (!rename($rutaTemporal, $rutaDestino)) {
+                        @unlink($rutaTemporal);
+
+                        throw new \RuntimeException(
+                            'No se pudo mover el archivo temporal a su ubicación final.'
+                        );
+                    }
+
+                    @chmod($rutaDestino, 0664);
+
+                    Log::info('Archivo de Nubefact descargado correctamente', [
+                        'tipo' => $tipoArchivo,
+                        'ruta' => $rutaDestino,
+                        'bytes' => $bytesEscritos,
+                        'intento' => $intento,
+                    ]);
+
+                    return;
+                }
+
+                $ultimoError = sprintf(
+                    'HTTP %s, Content-Type: %s, respuesta: %s',
+                    $response->status(),
+                    $response->header('Content-Type') ?: 'no informado',
+                    substr(
+                        trim(strip_tags($contenido)),
+                        0,
+                        300
+                    )
+                );
+
+                Log::warning('Nubefact devolvió un archivo inválido', [
+                    'tipo' => $tipoArchivo,
+                    'url' => $url,
+                    'intento' => $intento,
+                    'http_status' => $response->status(),
+                    'content_type' => $response->header('Content-Type'),
+                    'body_preview' => substr($contenido, 0, 500),
+                ]);
+            } catch (\Throwable $e) {
+                $ultimoError = $e->getMessage();
+
+                Log::warning('Error al descargar archivo de Nubefact', [
+                    'tipo' => $tipoArchivo,
+                    'url' => $url,
+                    'intento' => $intento,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+
+            if ($intento < $maxIntentos) {
+                /*
+                 * Esperas progresivas:
+                 * intento 1: espera 2 segundos
+                 * intento 2: espera 4 segundos
+                 */
+                sleep($intento * 2);
+            }
+        }
+
+        throw new \RuntimeException(
+            'No se pudo descargar un archivo '
+            . strtoupper($tipoArchivo)
+            . ' válido desde Nubefact. '
+            . $ultimoError
+        );
+    }
+
+    private function contenidoNubefactEsValido(string $contenido,string $tipoArchivo,?string $contentType = null): bool {
+        if ($contenido === '') {
+            return false;
+        }
+
+        $tipoArchivo = strtolower($tipoArchivo);
+        $contentType = strtolower((string) $contentType);
+
+        /*
+         * Evitamos aceptar páginas HTML de error como:
+         * 502 Bad Gateway
+         * 503 Service Unavailable
+         * 504 Gateway Timeout
+         */
+        if (
+            strpos($contentType, 'text/html') !== false ||
+            stripos(ltrim($contenido), '<!doctype html') === 0 ||
+            stripos(ltrim($contenido), '<html') === 0
+        ) {
+            return false;
+        }
+
+        if ($tipoArchivo === 'pdf') {
+            return substr($contenido, 0, 5) === '%PDF-';
+        }
+
+        if ($tipoArchivo === 'zip') {
+            /*
+             * Los archivos ZIP comienzan normalmente con PK.
+             * El CDR de Nubefact se descarga como ZIP.
+             */
+            return substr($contenido, 0, 2) === 'PK';
+        }
+
+        if ($tipoArchivo === 'xml') {
+            $contenidoLimpio = ltrim($contenido);
+
+            libxml_use_internal_errors(true);
+
+            $xml = simplexml_load_string($contenidoLimpio);
+
+            libxml_clear_errors();
+
+            return $xml !== false;
+        }
+
+        return false;
+    }
+
+    private function consultarComprobanteNubefact(Sale $sale): array
+    {
+        if (!in_array($sale->type_document, ['01', '03'])) {
+            throw new \RuntimeException(
+                'La venta no corresponde a una boleta o factura electrónica.'
+            );
+        }
+
+        if (empty($sale->serie_sunat) || empty($sale->numero)) {
+            throw new \RuntimeException(
+                'La venta no tiene serie o número SUNAT para consultar el comprobante.'
+            );
+        }
+
+        $token = config('services.nubefact.token');
+        $url = config('services.nubefact.url');
+
+        if (empty($token) || empty($url)) {
+            throw new \RuntimeException(
+                'Faltan las credenciales de Nubefact.'
+            );
+        }
+
+        /*
+         * Nubefact utiliza:
+         * 1 = Factura
+         * 2 = Boleta
+         *
+         * En nuestra base:
+         * 01 = Factura
+         * 03 = Boleta
+         */
+        $tipoComprobanteNubefact =
+            $sale->type_document === '01' ? 1 : 2;
+
+        $data = [
+            'operacion' => 'consultar_comprobante',
+            'tipo_de_comprobante' => $tipoComprobanteNubefact,
+            'serie' => $sale->serie_sunat,
+            'numero' => (int) $sale->numero,
+        ];
+
+        try {
+            /*
+             * Compatible con Laravel 7:
+             * no usamos connectTimeout().
+             */
+            $response = Http::withHeaders([
+                'Authorization' => 'Token token=' . $token,
+                'Accept' => 'application/json',
+                'Content-Type' => 'application/json',
+            ])
+                ->timeout(60)
+                ->post($url, $data);
+
+        } catch (\Throwable $e) {
+            Log::error(
+                'No se pudo conectar con Nubefact al consultar comprobante',
+                [
+                    'sale_id' => $sale->id,
+                    'serie' => $sale->serie_sunat,
+                    'numero' => $sale->numero,
+                    'error' => $e->getMessage(),
+                ]
+            );
+
+            throw new \RuntimeException(
+                'No se pudo establecer conexión con Nubefact: '
+                . $e->getMessage()
+            );
+        }
+
+        $result = $response->json();
+
+        if (!$response->successful()) {
+            $mensaje = is_array($result)
+                ? json_encode(
+                    $result,
+                    JSON_UNESCAPED_UNICODE
+                )
+                : substr($response->body(), 0, 1000);
+
+            Log::error(
+                'Nubefact respondió error al consultar comprobante',
+                [
+                    'sale_id' => $sale->id,
+                    'http_status' => $response->status(),
+                    'response' => $mensaje,
+                ]
+            );
+
+            throw new \RuntimeException(
+                'Nubefact respondió con HTTP '
+                . $response->status()
+                . ': '
+                . $mensaje
+            );
+        }
+
+        if (!is_array($result)) {
+            Log::error(
+                'Nubefact devolvió una respuesta inválida al consultar comprobante',
+                [
+                    'sale_id' => $sale->id,
+                    'http_status' => $response->status(),
+                    'response' => substr(
+                        $response->body(),
+                        0,
+                        1000
+                    ),
+                ]
+            );
+
+            throw new \RuntimeException(
+                'Nubefact devolvió una respuesta inválida.'
+            );
+        }
+
+        if (!empty($result['errors'])) {
+            $errores = is_array($result['errors'])
+                ? json_encode(
+                    $result['errors'],
+                    JSON_UNESCAPED_UNICODE
+                )
+                : (string) $result['errors'];
+
+            throw new \RuntimeException(
+                'Error desde Nubefact: ' . $errores
+            );
+        }
+
+        /*
+         * Para este proceso necesitamos al menos uno de los enlaces.
+         */
+        if (
+            empty($result['enlace_del_pdf']) &&
+            empty($result['enlace_del_xml']) &&
+            empty($result['enlace_del_cdr'])
+        ) {
+            Log::warning(
+                'La consulta del comprobante no devolvió enlaces',
+                [
+                    'sale_id' => $sale->id,
+                    'result' => $result,
+                ]
+            );
+
+            throw new \RuntimeException(
+                'Nubefact encontró el comprobante, pero todavía no devolvió enlaces de descarga.'
+            );
+        }
+
+        return $result;
     }
 }

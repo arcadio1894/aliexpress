@@ -1225,6 +1225,36 @@ $(document).ready(function () {
     $('#modalNcPartialItems').on('shown.bs.modal', function () {
         $('#nc_partial_item_search').val('').focus();
     });
+
+    $(document).on(
+        'click',
+        '[data-recuperar_archivos_nubefact]',
+        function () {
+            const saleId = $(this).data('sale_id');
+
+            $.confirm({
+                title: 'Recuperar comprobante',
+                content:
+                    'Se volverán a consultar y descargar los archivos ' +
+                    'del comprobante desde Nubefact.<br><br>' +
+                    '¿Desea continuar?',
+                type: 'blue',
+                buttons: {
+                    confirmar: {
+                        text: 'Sí, recuperar',
+                        btnClass: 'btn-primary',
+                        action: function () {
+                            recuperarArchivosNubefact(saleId);
+                        }
+                    },
+                    cancelar: {
+                        text: 'Cancelar',
+                        btnClass: 'btn-secondary'
+                    }
+                }
+            });
+        }
+    );
 });
 
 var $formDelete;
@@ -1234,6 +1264,86 @@ var $permissions;
 
 let ncPartialData = null;
 let ncPartialSelectedItems = {};
+
+function recuperarArchivosNubefact(saleId) {
+    const processingDialog = $.dialog({
+        title: false,
+        content:
+            '<div class="text-center py-4">' +
+            '<div class="spinner-border text-primary mb-3" ' +
+            'role="status">' +
+            '<span class="sr-only">Procesando...</span>' +
+            '</div>' +
+            '<h5 class="mb-2">' +
+            'Recuperando comprobante' +
+            '</h5>' +
+            '<p class="text-muted mb-0">' +
+            'Estamos consultando los archivos en Nubefact.' +
+            '</p>' +
+            '</div>',
+        columnClass: 'col-md-5 col-md-offset-4',
+        containerFluid: true,
+        backgroundDismiss: false,
+        closeIcon: false,
+        escapeKey: false
+    });
+
+    $.ajax({
+        url: '/dashboard/ventas/' +
+            saleId +
+            '/recuperar-archivos-nubefact',
+
+        method: 'POST',
+
+        headers: {
+            'X-CSRF-TOKEN': $(
+                'meta[name="csrf-token"]'
+            ).attr('content')
+        },
+
+        success: function (data) {
+            if (data.partial) {
+                toastr.warning(
+                    data.message,
+                    'Recuperación parcial',
+                    {
+                        closeButton: true,
+                        progressBar: true,
+                        timeOut: '5000'
+                    }
+                );
+            } else {
+                toastr.success(
+                    data.message,
+                    'Éxito',
+                    {
+                        closeButton: true,
+                        progressBar: true,
+                        timeOut: '3000'
+                    }
+                );
+            }
+
+            reloadCurrentPageOrders();
+        },
+
+        error: function (xhr) {
+            const message =
+                xhr.responseJSON &&
+                xhr.responseJSON.message
+                    ? xhr.responseJSON.message
+                    : 'No se pudieron recuperar los archivos del comprobante.';
+
+            toastr.error(message, 'Error');
+        },
+
+        complete: function () {
+            if (processingDialog) {
+                processingDialog.close();
+            }
+        }
+    });
+}
 
 function prepararEnvioNotaCreditoParcial() {
     let saleId = $('#nc_partial_sale_id').val();
@@ -2455,7 +2565,7 @@ function renderDataTable(data) {
 
     cloneBtnActive.querySelector("[data-ver_detalles]").setAttribute("data-id", data.id);
 
-    const printBtn = cloneBtnActive.querySelector("[data-print_recibo]");
+    /*const printBtn = cloneBtnActive.querySelector("[data-print_recibo]");
     printBtn.setAttribute("data-id", data.id);
     printBtn.setAttribute("href", data.print_url || "#");
     printBtn.setAttribute("title", data.print_label || "Ver comprobante");
@@ -2463,6 +2573,49 @@ function renderDataTable(data) {
     if (!data.print_url) {
         printBtn.classList.add('disabled');
         printBtn.removeAttribute('target');
+        printBtn.addEventListener('click', function (e) {
+            e.preventDefault();
+        });
+    } else {
+        printBtn.setAttribute('target', '_blank');
+    }*/
+
+    /*
+ * Botón para volver a consultar y descargar los archivos
+ * del comprobante desde Nubefact.
+ */
+    const btnRecuperarArchivos = cloneBtnActive.querySelector(
+        "[data-recuperar_archivos_nubefact]"
+    );
+
+    if (data.can_retry_nubefact_files) {
+        btnRecuperarArchivos.setAttribute(
+            "data-sale_id",
+            data.id
+        );
+    } else {
+        btnRecuperarArchivos.remove();
+    }
+
+    const printBtn = cloneBtnActive.querySelector(
+        "[data-print_recibo]"
+    );
+
+    printBtn.setAttribute("data-id", data.id);
+    printBtn.setAttribute(
+        "href",
+        data.print_url || "#"
+    );
+
+    printBtn.setAttribute(
+        "title",
+        data.print_label || "Ver comprobante"
+    );
+
+    if (!data.print_url) {
+        printBtn.classList.add('disabled');
+        printBtn.removeAttribute('target');
+
         printBtn.addEventListener('click', function (e) {
             e.preventDefault();
         });
