@@ -291,6 +291,14 @@
                                     </a>
                                 </li>
                             @endcan
+                            @can('createFreeSale_puntoVenta')
+                                <li class="nav-item">
+                                    <a href="{{ route('freeSale.create') }}" class="nav-link @yield('activeCreateFreeSale')">
+                                        <i class="far fa-circle nav-icon"></i>
+                                        <p>Venta Libre</p>
+                                    </a>
+                                </li>
+                            @endcan
                             @can('list_puntoVenta')
                             <li class="nav-item">
                                 <a href="{{ route('puntoVenta.list') }}" class="nav-link @yield('activeListPuntoVenta')">

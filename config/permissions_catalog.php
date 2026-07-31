@@ -326,6 +326,9 @@ return [
     'list_quoteSale' => 'Ver listado de cotizaciones de ventas',
     'generarComprobante_quoteSale' => 'Generar comprobantes de cotizaciones',
 
+    'createFreeSale_puntoVenta' => 'Crear ventas libre en punto de venta',
+    'anularFreeSale_puntoVenta' => 'Anular ventas libre en punto de venta',
+
     'generarBoleta_quoteSale' => 'Generar Boleta de cotizaciones',
     'generarFactura_quoteSale' => 'Generar Factura de cotizaciones',
 

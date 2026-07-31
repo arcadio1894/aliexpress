@@ -25,6 +25,8 @@ class CreditNote extends Model
         'sunat_message',
         'sunat_ticket',
         'nubefact_key',
+        'generation_key',
+        'sunat_responsecode',
         'nubefact_response',
         'pdf_path',
         'xml_path',

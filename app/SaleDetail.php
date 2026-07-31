@@ -18,6 +18,7 @@ class SaleDetail extends Model
         'packs',
         'units_per_pack',
         'percentage_tax',
+        'tax_amount',
         'total',
         'discount',
         'unit_cost',
