@@ -10,7 +10,7 @@ use Illuminate\Support\Str;
 
 trait NubefactTrait
 {
-    private function buildNubefactData(Sale $order): array
+    private function buildNubefactDataO(Sale $order): array
     {
         $order->loadMissing([
             'details.material',
@@ -189,6 +189,494 @@ trait NubefactTrait
             ];
     }
 
+    private function buildNubefactData(Sale $order): array
+    {
+        $order->loadMissing([
+            'details.material',
+            'details.stockItem',
+        ]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | IDENTIFICAR EL TIPO DE VENTA
+        |--------------------------------------------------------------------------
+        |
+        | Las ventas normales y provenientes de cotizaciones conservan
+        | exactamente el comportamiento que ya tenían.
+        |
+        | La lógica especial solo se aplica cuando free_sale = 1.
+        */
+        $isFreeSale = (bool) $order->free_sale;
+
+        $isFactura = $order->type_document === '01';
+
+        /*
+         * Se conservan las series utilizadas actualmente.
+         */
+        $serie = $isFactura
+            ? 'FFF1'
+            : 'BBB1';
+
+        $tipoCliente = $order->tipo_documento_cliente
+            ?: ($isFactura ? '6' : '1');
+
+        /*
+        |--------------------------------------------------------------------------
+        | CONSTRUIR DETALLES
+        |--------------------------------------------------------------------------
+        */
+        $items = $order->details
+            ->map(function ($item) use ($isFreeSale) {
+
+                /*
+                 * En ventas normales, un material_id vacío continúa
+                 * identificándose como servicio, igual que antes.
+                 */
+                $isService = empty($item->material_id);
+
+                /*
+                |--------------------------------------------------------------------------
+                | CANTIDAD
+                |--------------------------------------------------------------------------
+                |
+                | Se conserva la lógica existente:
+                |
+                | - Sin presentación: quantity.
+                | - Con presentación: packs.
+                */
+                $qty = (string) (
+                $item->material_presentation_id == null
+                    ? (float) $item->quantity
+                    : (float) $item->packs
+                );
+
+                if ((float) $qty <= 0) {
+                    throw new \Exception(
+                        "Cantidad inválida en detalle {$item->id}"
+                    );
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | PRECIOS Y TOTAL DE LA LÍNEA
+                |--------------------------------------------------------------------------
+                |
+                | Estos valores provienen directamente de SaleDetail.
+                |
+                | total:
+                | Cantidad por precio unitario con IGV.
+                |
+                | price:
+                | Precio unitario con IGV.
+                |
+                | valor_unitario:
+                | Precio unitario sin IGV.
+                */
+                $totalLine = (string) $item->total;
+
+                $precioUnitario = (string) $item->price;
+
+                $valorUnitario = (string) $item->valor_unitario;
+
+                if ((float) $totalLine < 0) {
+                    throw new \Exception(
+                        "Total inválido en detalle {$item->id}"
+                    );
+                }
+
+                if ((float) $precioUnitario < 0) {
+                    throw new \Exception(
+                        "Precio unitario inválido en detalle {$item->id}"
+                    );
+                }
+
+                if ((float) $valorUnitario < 0) {
+                    throw new \Exception(
+                        "Valor unitario inválido en detalle {$item->id}"
+                    );
+                }
+
+                /*
+                 * Base imponible de la línea.
+                 */
+                $subtotal = bcmul(
+                    $valorUnitario,
+                    $qty,
+                    10
+                );
+
+                /*
+                |--------------------------------------------------------------------------
+                | IGV DEL DETALLE
+                |--------------------------------------------------------------------------
+                |
+                | Venta libre:
+                | Usa tax_amount porque fue calculado explícitamente
+                | cuando se registró la venta.
+                |
+                | Venta normal o cotización:
+                | Conserva exactamente el cálculo histórico:
+                | total - subtotal.
+                */
+                if (
+                    $isFreeSale &&
+                    !is_null($item->tax_amount)
+                ) {
+                    $igv = number_format(
+                        (float) $item->tax_amount,
+                        10,
+                        '.',
+                        ''
+                    );
+                } else {
+                    $igv = bcsub(
+                        $totalLine,
+                        $subtotal,
+                        10
+                    );
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | DESCRIPCIÓN
+                |--------------------------------------------------------------------------
+                */
+                if ($isFreeSale) {
+                    /*
+                     * Venta libre:
+                     * La descripción fue escrita manualmente.
+                     */
+                    $description = trim(
+                        (string) $item->description
+                    );
+
+                    $descripcion = $description !== ''
+                        ? mb_strtoupper(
+                            $description,
+                            'UTF-8'
+                        )
+                        : 'SERVICIO';
+
+                } elseif ($isService) {
+                    /*
+                     * Servicio de una venta normal:
+                     * Se conserva el comportamiento anterior.
+                     */
+                    $description = trim(
+                        (string) $item->description
+                    );
+
+                    $descripcion = $description !== ''
+                        ? mb_strtoupper(
+                            $description,
+                            'UTF-8'
+                        )
+                        : 'SERVICIO';
+
+                } else {
+                    /*
+                     * Producto de inventario:
+                     * Se conserva la lógica anterior.
+                     */
+                    $present = (string) (
+                    $item->material_presentation_id == null
+                        ? round(
+                        (float) $item->quantity
+                    )
+                        : $item->units_per_pack . 'und'
+                    );
+
+                    $descripcion = '(' . $present . ') ';
+
+                    if (
+                        !empty($item->stock_item_id) &&
+                        $item->stockItem
+                    ) {
+                        $descripcion .=
+                            $item->stockItem->display_name;
+
+                    } elseif ($item->material) {
+                        $descripcion .=
+                            $item->material->full_name;
+
+                    } elseif (
+                        trim((string) $item->description) !== ''
+                    ) {
+                        /*
+                         * Fallback adicional sin alterar el flujo normal.
+                         */
+                        $descripcion .= trim(
+                            (string) $item->description
+                        );
+
+                    } else {
+                        $descripcion .=
+                            'Material ' . $item->material_id;
+                    }
+
+                    /*
+                    |--------------------------------------------------------------------------
+                    | CÓDIGOS DE ÍTEMS FÍSICOS
+                    |--------------------------------------------------------------------------
+                    |
+                    | Se conserva el comportamiento anterior para productos
+                    | itemeables.
+                    */
+                    $itemSnapshot = $item->item_snapshot ?? [];
+
+                    if (is_string($itemSnapshot)) {
+                        $decodedSnapshot = json_decode(
+                            $itemSnapshot,
+                            true
+                        );
+
+                        $itemSnapshot = is_array($decodedSnapshot)
+                            ? $decodedSnapshot
+                            : [];
+                    }
+
+                    if (!is_array($itemSnapshot)) {
+                        $itemSnapshot = [];
+                    }
+
+                    $itemCodes = collect($itemSnapshot)
+                        ->map(function ($snapshotItem) {
+                            if (is_array($snapshotItem)) {
+                                return $snapshotItem['code']
+                                    ?? null;
+                            }
+
+                            if (is_object($snapshotItem)) {
+                                return $snapshotItem->code
+                                    ?? null;
+                            }
+
+                            return null;
+                        })
+                        ->filter()
+                        ->values()
+                        ->toArray();
+
+                    if (!empty($itemCodes)) {
+                        $descripcion .=
+                            ' | Items: ' .
+                            implode(', ', $itemCodes);
+                    }
+                }
+
+                return [
+                    'unidad_de_medida' => 'NIU',
+                    'codigo' => '',
+                    'descripcion' => $descripcion,
+                    'cantidad' => (float) $qty,
+
+                    /*
+                     * Precio unitario sin IGV.
+                     */
+                    'valor_unitario' =>
+                        (float) $valorUnitario,
+
+                    /*
+                     * Precio unitario con IGV.
+                     */
+                    'precio_unitario' =>
+                        (float) $precioUnitario,
+
+                    /*
+                     * Base imponible del detalle.
+                     */
+                    'subtotal' =>
+                        (float) $subtotal,
+
+                    'tipo_de_igv' => '1',
+
+                    /*
+                     * IGV de toda la línea.
+                     */
+                    'igv' => (float) $igv,
+
+                    /*
+                     * Total de la línea con IGV.
+                     */
+                    'total' => (float) $totalLine,
+                ];
+            })
+            ->values()
+            ->toArray();
+
+        /*
+        |--------------------------------------------------------------------------
+        | TOTALES GENERALES
+        |--------------------------------------------------------------------------
+        */
+        $discount = $order->total_descuentos ?? 0;
+
+        $totalGravada = $order->op_gravada ?? 0;
+
+        if ($isFreeSale) {
+            /*
+             * Venta libre:
+             *
+             * Los valores fueron calculados en backend al crear la venta.
+             * No volvemos a calcularlos para evitar diferencias de redondeo.
+             */
+            $base = number_format(
+                (float) ($order->op_gravada ?? 0),
+                10,
+                '.',
+                ''
+            );
+
+            $totalIgv = number_format(
+                (float) ($order->igv ?? 0),
+                10,
+                '.',
+                ''
+            );
+
+            $total = number_format(
+                (float) ($order->importe_total ?? 0),
+                10,
+                '.',
+                ''
+            );
+
+        } else {
+            /*
+             * Ventas normales y cotizaciones:
+             *
+             * Se conserva exactamente el comportamiento anterior.
+             */
+            $base = $totalGravada;
+
+            $totalIgv = bcmul(
+                (string) $base,
+                '0.18',
+                10
+            );
+
+            $total = bcadd(
+                (string) $base,
+                (string) $totalIgv,
+                10
+            );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | VALIDACIONES MÍNIMAS
+        |--------------------------------------------------------------------------
+        */
+        if ((float) $base < 0) {
+            throw new \Exception(
+                'La operación gravada no puede ser negativa.'
+            );
+        }
+
+        if ((float) $totalIgv < 0) {
+            throw new \Exception(
+                'El IGV no puede ser negativo.'
+            );
+        }
+
+        if ((float) $total <= 0) {
+            throw new \Exception(
+                'El importe total debe ser mayor que cero.'
+            );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | PAYLOAD PRINCIPAL
+        |--------------------------------------------------------------------------
+        */
+        $payload = [
+            'operacion' => 'generar_comprobante',
+
+            'tipo_de_comprobante' =>
+                $isFactura ? '1' : '2',
+
+            'serie' => $serie,
+
+            'numero' => '',
+
+            'codigo_unico' =>
+                (string) Str::uuid(),
+
+            'sunat_transaction' => '1',
+
+            'cliente_tipo_de_documento' =>
+                $tipoCliente,
+
+            'cliente_numero_de_documento' =>
+                $order->numero_documento_cliente,
+
+            'cliente_denominacion' =>
+                $order->nombre_cliente,
+
+            'cliente_direccion' =>
+                $order->direccion_cliente ?: '',
+
+            'cliente_email' =>
+                $order->email_cliente ?: '',
+
+            'fecha_de_emision' =>
+                now()->format('d-m-Y'),
+
+            /*
+             * 1 corresponde a soles.
+             * Se conserva el comportamiento actual.
+             */
+            'moneda' => '1',
+
+            'porcentaje_de_igv' => 18.00,
+
+            'total_gravada' =>
+                (float) $base,
+
+            'total_igv' =>
+                (float) $totalIgv,
+
+            'total' =>
+                (float) $total,
+
+            'total_a_pagar' =>
+                (float) $total,
+        ];
+
+        /*
+        |--------------------------------------------------------------------------
+        | DESCUENTO GLOBAL
+        |--------------------------------------------------------------------------
+        |
+        | Se conserva exactamente el comportamiento que ya utilizabas.
+        |
+        | En Venta Libre actualmente será cero porque el descuento está
+        | temporalmente deshabilitado.
+        */
+        if ((float) $discount > 0) {
+            $payload['descuento_global'] =
+                number_format(
+                    (float) $discount,
+                    10,
+                    '.',
+                    ''
+                );
+
+            $payload['total_descuento'] =
+                number_format(
+                    (float) $discount,
+                    10,
+                    '.',
+                    ''
+                );
+        }
+
+        $payload['items'] = $items;
+
+        return $payload;
+    }
+
     private function trunc2($value): string
     {
         // asegura string con decimales
@@ -272,7 +760,6 @@ trait NubefactTrait
                 'Accept' => 'application/json',
                 'Content-Type' => 'application/json',
             ])
-                /*->connectTimeout(15)*/
                 ->timeout(60)
                 ->post($url, $data);
         } catch (\Throwable $e) {
@@ -383,7 +870,7 @@ trait NubefactTrait
         ]);
     }
 
-    private function persistNubefactFilesAndUpdateSale(Sale $order, array $result): array {
+    private function persistNubefactFilesAndUpdateSaleO2(Sale $order, array $result): array {
         $filename = 'ORD' . $order->id;
 
         $pdfFilename = $filename . '.pdf';
@@ -548,6 +1035,275 @@ trait NubefactTrait
         if (!empty($archivosActualizar)) {
             $order->update($archivosActualizar);
         }
+
+        return $resultado;
+    }
+
+    private function persistNubefactFilesAndUpdateSale(Sale $order, array $result): array {
+        /*
+        |--------------------------------------------------------------------------
+        | 1. VALIDAR RESPUESTA MÍNIMA DEL COMPROBANTE
+        |--------------------------------------------------------------------------
+        */
+        $serie = trim(
+            (string) ($result['serie'] ?? '')
+        );
+
+        $numero = trim(
+            (string) ($result['numero'] ?? '')
+        );
+
+        if ($serie === '' || $numero === '') {
+            throw new \RuntimeException(
+                'No se puede persistir el comprobante porque Nubefact no devolvió serie o número.'
+            );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2. GUARDAR PRIMERO LA INFORMACIÓN SUNAT
+        |--------------------------------------------------------------------------
+        |
+        | La emisión no depende de que posteriormente se pueda descargar
+        | el PDF, XML o CDR.
+        */
+        $sunatStatus = $result['sunat_description']
+            ?? $result['aceptada_por_sunat']
+            ?? 'Enviado';
+
+        if (is_bool($sunatStatus)) {
+            $sunatStatus = $sunatStatus
+                ? 'Aceptado'
+                : 'Enviado';
+        }
+
+        $sunatMessage = $result['sunat_note']
+            ?? $result['sunat_soap_error']
+            ?? '';
+
+        $order->update([
+            'serie_sunat' => $serie,
+            'numero' => $numero,
+
+            'sunat_ticket' =>
+                $result['sunat_ticket']
+                ?? $result['sunat_ticket_numero']
+                ?? null,
+
+            'sunat_status' =>
+                (string) $sunatStatus,
+
+            'sunat_message' =>
+                is_array($sunatMessage)
+                    ? json_encode(
+                    $sunatMessage,
+                    JSON_UNESCAPED_UNICODE
+                )
+                    : (string) $sunatMessage,
+
+            'fecha_emision' => now()->toDateString(),
+        ]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 3. PREPARAR NOMBRES Y DIRECTORIOS
+        |--------------------------------------------------------------------------
+        */
+        $filename = 'ORD' . $order->id;
+
+        $pdfFilename = $filename . '.pdf';
+        $xmlFilename = $filename . '.xml';
+        $cdrFilename = $filename . '.zip';
+
+        $pdfDirectory =
+            public_path('comprobantes/pdfs');
+
+        $xmlDirectory =
+            public_path('comprobantes/xmls');
+
+        $cdrDirectory =
+            public_path('comprobantes/cdrs');
+
+        foreach (
+            [
+                $pdfDirectory,
+                $xmlDirectory,
+                $cdrDirectory,
+            ] as $directory
+        ) {
+            if (!is_dir($directory)) {
+                if (
+                    !mkdir($directory, 0755, true) &&
+                    !is_dir($directory)
+                ) {
+                    throw new \RuntimeException(
+                        'No se pudo crear el directorio: ' .
+                        $directory
+                    );
+                }
+            }
+        }
+
+        $pdfPath =
+            $pdfDirectory .
+            DIRECTORY_SEPARATOR .
+            $pdfFilename;
+
+        $xmlPath =
+            $xmlDirectory .
+            DIRECTORY_SEPARATOR .
+            $xmlFilename;
+
+        $cdrPath =
+            $cdrDirectory .
+            DIRECTORY_SEPARATOR .
+            $cdrFilename;
+
+        $resultado = [
+            'comprobante_registrado' => true,
+
+            'pdf_descargado' => false,
+            'xml_descargado' => false,
+            'cdr_descargado' => false,
+
+            'errores' => [],
+        ];
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4. DESCARGAR PDF
+        |--------------------------------------------------------------------------
+        */
+        if (!empty($result['enlace_del_pdf'])) {
+            try {
+                $this->descargarArchivoNubefactSeguro(
+                    $result['enlace_del_pdf'],
+                    $pdfPath,
+                    'pdf'
+                );
+
+                $resultado['pdf_descargado'] = true;
+
+            } catch (\Throwable $e) {
+                $resultado['errores'][] =
+                    'PDF: ' . $e->getMessage();
+
+                Log::error(
+                    'Comprobante emitido, pero falló la descarga del PDF',
+                    [
+                        'sale_id' => $order->id,
+                        'url' => $result['enlace_del_pdf'],
+                        'error' => $e->getMessage(),
+                    ]
+                );
+            }
+        } else {
+            $resultado['errores'][] =
+                'Nubefact no devolvió enlace del PDF.';
+
+            Log::warning(
+                'Nubefact no devolvió enlace del PDF',
+                [
+                    'sale_id' => $order->id,
+                ]
+            );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 5. DESCARGAR XML
+        |--------------------------------------------------------------------------
+        */
+        if (!empty($result['enlace_del_xml'])) {
+            try {
+                $this->descargarArchivoNubefactSeguro(
+                    $result['enlace_del_xml'],
+                    $xmlPath,
+                    'xml'
+                );
+
+                $resultado['xml_descargado'] = true;
+
+            } catch (\Throwable $e) {
+                $resultado['errores'][] =
+                    'XML: ' . $e->getMessage();
+
+                Log::error(
+                    'Comprobante emitido, pero falló la descarga del XML',
+                    [
+                        'sale_id' => $order->id,
+                        'url' => $result['enlace_del_xml'],
+                        'error' => $e->getMessage(),
+                    ]
+                );
+            }
+        } else {
+            $resultado['errores'][] =
+                'Nubefact no devolvió enlace del XML.';
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 6. DESCARGAR CDR
+        |--------------------------------------------------------------------------
+        */
+        if (!empty($result['enlace_del_cdr'])) {
+            try {
+                $this->descargarArchivoNubefactSeguro(
+                    $result['enlace_del_cdr'],
+                    $cdrPath,
+                    'zip'
+                );
+
+                $resultado['cdr_descargado'] = true;
+
+            } catch (\Throwable $e) {
+                $resultado['errores'][] =
+                    'CDR: ' . $e->getMessage();
+
+                Log::error(
+                    'Comprobante emitido, pero falló la descarga del CDR',
+                    [
+                        'sale_id' => $order->id,
+                        'url' => $result['enlace_del_cdr'],
+                        'error' => $e->getMessage(),
+                    ]
+                );
+            }
+        } else {
+            $resultado['errores'][] =
+                'Nubefact no devolvió enlace del CDR.';
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 7. GUARDAR ÚNICAMENTE ARCHIVOS VÁLIDOS
+        |--------------------------------------------------------------------------
+        */
+        $archivosActualizar = [];
+
+        if ($resultado['pdf_descargado']) {
+            $archivosActualizar['pdf_path'] =
+                $pdfFilename;
+        }
+
+        if ($resultado['xml_descargado']) {
+            $archivosActualizar['xml_path'] =
+                $xmlFilename;
+        }
+
+        if ($resultado['cdr_descargado']) {
+            $archivosActualizar['cdr_path'] =
+                $cdrFilename;
+        }
+
+        if (!empty($archivosActualizar)) {
+            $order->update(
+                $archivosActualizar
+            );
+        }
+
+        $order->refresh();
 
         return $resultado;
     }
@@ -751,6 +1507,13 @@ trait NubefactTrait
             'details.stockItem'
         ]);
 
+        if (empty($creditNote->generation_key)) {
+            $creditNote->generation_key =
+                (string) Str::uuid();
+
+            $creditNote->save();
+        }
+
         $isFactura = $sale->type_document === '01';
 
         $serieNotaCredito = $isFactura
@@ -800,7 +1563,8 @@ trait NubefactTrait
             "tipo_de_comprobante" => "3", // Nota de crédito
             "serie" => $serieNotaCredito,
             "numero" => "",
-            "codigo_unico" => 'NC-' . $sale->id . '-' . now()->timestamp . '-' . Str::random(8),
+            /*"codigo_unico" => 'NC-' . $sale->id . '-' . now()->timestamp . '-' . Str::random(8),*/
+            "codigo_unico" => $creditNote->generation_key,
             "sunat_transaction" => "1",
 
             "cliente_tipo_de_documento" => $sale->tipo_documento_cliente,
@@ -833,6 +1597,30 @@ trait NubefactTrait
     {
         $data = $this->buildNubefactCreditNoteTotalData($sale, $creditNote);
 
+        Log::info(
+            'Payload Nota de Crédito Nubefact',
+            [
+                'sale_id' => $sale->id,
+                'credit_note_id' =>
+                    $creditNote->id,
+
+                'original_document' => [
+                    'type_document' =>
+                        $sale->type_document,
+
+                    'serie' =>
+                        $sale->serie_sunat,
+
+                    'numero' =>
+                        $sale->numero,
+                ],
+
+                'generation_key' =>
+                    $creditNote->generation_key,
+
+                'payload' => $data,
+            ]
+        );
         //dd($data);
 
         $token = config('services.nubefact.token');
@@ -842,101 +1630,533 @@ trait NubefactTrait
             throw new \Exception('Faltan credenciales Nubefact.');
         }
 
-        $response = Http::withHeaders([
-            'Authorization' => 'Token token=' . $token,
-            'Content-Type' => 'application/json',
-        ])->post($url, $data);
+        try {
+            $response = Http::withHeaders([
+                'Authorization' =>
+                    'Token token=' . $token,
+
+                'Accept' =>
+                    'application/json',
+
+                'Content-Type' =>
+                    'application/json',
+            ])
+                ->timeout(60)
+                ->post($url, $data);
+
+        } catch (\Throwable $e) {
+            Log::error(
+                'No se pudo conectar con Nubefact al generar Nota de Crédito',
+                [
+                    'sale_id' => $sale->id,
+                    'credit_note_id' =>
+                        $creditNote->id,
+
+                    'error' => $e->getMessage(),
+                ]
+            );
+
+            throw new \RuntimeException(
+                'No se pudo establecer conexión con Nubefact: ' .
+                $e->getMessage()
+            );
+        }
 
         $result = $response->json();
 
-        if (!$response->ok()) {
-            $msg = is_array($result) ? json_encode($result) : $response->body();
-            throw new \Exception('Nubefact respondió error HTTP al generar Nota de Crédito: ' . $msg);
+        if (!$response->successful()) {
+            $message = is_array($result)
+                ? json_encode(
+                    $result,
+                    JSON_UNESCAPED_UNICODE
+                )
+                : substr(
+                    $response->body(),
+                    0,
+                    1000
+                );
+
+            Log::error(
+                'Nubefact respondió error HTTP al generar Nota de Crédito',
+                [
+                    'sale_id' => $sale->id,
+                    'credit_note_id' =>
+                        $creditNote->id,
+
+                    'http_status' =>
+                        $response->status(),
+
+                    'response' => $message,
+                ]
+            );
+
+            throw new \RuntimeException(
+                'Nubefact respondió con HTTP ' .
+                $response->status() .
+                ': ' .
+                $message
+            );
         }
 
-        if (isset($result['errors'])) {
-            throw new \Exception('Error desde Nubefact: ' . $result['errors']);
+        if (!is_array($result)) {
+            throw new \RuntimeException(
+                'Nubefact devolvió una respuesta inválida para la Nota de Crédito.'
+            );
         }
+
+        if (!empty($result['errors'])) {
+            $errors = is_array(
+                $result['errors']
+            )
+                ? json_encode(
+                    $result['errors'],
+                    JSON_UNESCAPED_UNICODE
+                )
+                : (string) $result['errors'];
+
+            throw new \RuntimeException(
+                'Error desde Nubefact: ' .
+                $errors
+            );
+        }
+
+        Log::info(
+            'Respuesta Nota de Crédito Nubefact',
+            [
+                'sale_id' => $sale->id,
+                'credit_note_id' =>
+                    $creditNote->id,
+
+                'result' => $result,
+            ]
+        );
 
         return $result;
     }
 
-    private function persistNubefactCreditNoteResult(CreditNote $creditNote, array $result): void
-    {
-        $accepted = (bool) ($result['aceptada_por_sunat'] ?? false);
+    private function persistNubefactCreditNoteResult(CreditNote $creditNote,array $result): void {
+        /*
+        |--------------------------------------------------------------------------
+        | 1. INTERPRETAR RESPUESTA DE NUBEFACT / SUNAT
+        |--------------------------------------------------------------------------
+        */
 
-        $description = $result['sunat_description'] ?? null;
-        $note = $result['sunat_note'] ?? null;
-        $soapError = $result['sunat_soap_error'] ?? null;
-        $responseCode = $result['sunat_responsecode'] ?? null;
-
-        $pdfUrl = $result['enlace_del_pdf'] ?? null;
-        $xmlUrl = $result['enlace_del_xml'] ?? null;
-        $cdrUrl = $result['enlace_del_cdr'] ?? null;
-
-        $filename = 'NC_' . $creditNote->id;
-
-        $pdfFilename = $filename . '.pdf';
-        $xmlFilename = $filename . '.xml';
-        $cdrFilename = $filename . '.zip';
-
-        foreach ([
-                     'notas_credito/pdfs',
-                     'notas_credito/xmls',
-                     'notas_credito/cdrs',
-                 ] as $folder) {
-            if (!file_exists(public_path("comprobantes/$folder"))) {
-                mkdir(public_path("comprobantes/$folder"), 0777, true);
-            }
+        if (
+            isset($result['invoice']) &&
+            is_array($result['invoice'])
+        ) {
+            $result = array_merge(
+                $result,
+                $result['invoice']
+            );
         }
 
-        if (!empty($pdfUrl)) {
-            $pdfContent = Http::get($pdfUrl)->body();
-            file_put_contents(public_path('comprobantes/notas_credito/pdfs/' . $pdfFilename), $pdfContent);
+        if (
+            isset($result['data']) &&
+            is_array($result['data'])
+        ) {
+            $result = array_merge(
+                $result,
+                $result['data']
+            );
         }
 
-        if (!empty($xmlUrl)) {
-            $xmlContent = Http::get($xmlUrl)->body();
-            file_put_contents(public_path('comprobantes/notas_credito/xmls/' . $xmlFilename), $xmlContent);
+        $accepted = filter_var(
+            $result['aceptada_por_sunat'] ?? false,
+            FILTER_VALIDATE_BOOLEAN
+        );
+
+        $description =
+            $result['sunat_description'] ?? null;
+
+        $note =
+            $result['sunat_note'] ?? null;
+
+        $soapError =
+            $result['sunat_soap_error'] ?? null;
+
+        $responseCode =
+            $result['sunat_responsecode'] ?? null;
+
+        $pdfUrl =
+            $result['enlace_del_pdf'] ?? null;
+
+        $xmlUrl =
+            $result['enlace_del_xml'] ?? null;
+
+        $cdrUrl =
+            $result['enlace_del_cdr'] ?? null;
+
+        /*
+         * Convertir posibles arreglos en texto.
+         */
+        if (is_array($description)) {
+            $description = json_encode(
+                $description,
+                JSON_UNESCAPED_UNICODE
+            );
         }
 
-        if (!empty($cdrUrl)) {
-            $cdrContent = Http::get($cdrUrl)->body();
-            file_put_contents(public_path('comprobantes/notas_credito/cdrs/' . $cdrFilename), $cdrContent);
+        if (is_array($note)) {
+            $note = json_encode(
+                $note,
+                JSON_UNESCAPED_UNICODE
+            );
         }
 
-        $finalMessage = $soapError ?: ($note ?: ($description ?: null));
+        if (is_array($soapError)) {
+            $soapError = json_encode(
+                $soapError,
+                JSON_UNESCAPED_UNICODE
+            );
+        }
 
-        $creditNote->serie = $result['serie'] ?? $creditNote->serie;
-        $creditNote->numero = $result['numero'] ?? $creditNote->numero;
-        $creditNote->sunat_ticket = $result['sunat_ticket'] ?? null;
-        $creditNote->nubefact_key = $result['key'] ?? null;
-        $creditNote->nubefact_response = json_encode($result, JSON_UNESCAPED_UNICODE);
+        $finalMessage =
+            $soapError
+                ?: ($note ?: ($description ?: null));
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2. GUARDAR INFORMACIÓN PRINCIPAL DE LA RESPUESTA
+        |--------------------------------------------------------------------------
+        |
+        | Guardamos esto antes de descargar los archivos.
+        | La respuesta fiscal no depende de que el PDF pueda descargarse.
+        */
+        $creditNote->serie =
+            $result['serie']
+            ?? $creditNote->serie;
+
+        $creditNote->numero =
+            $result['numero']
+            ?? $creditNote->numero;
+
+        $creditNote->sunat_ticket =
+            $result['sunat_ticket']
+            ?? $result['sunat_ticket_numero']
+            ?? null;
+
+        $creditNote->nubefact_key =
+            $result['key']
+            ?? $creditNote->nubefact_key;
+
+        $creditNote->nubefact_response =
+            json_encode(
+                $result,
+                JSON_UNESCAPED_UNICODE
+            );
+
+        $creditNote->sunat_responsecode =
+            is_null($responseCode)
+                ? null
+                : (string) $responseCode;
 
         $creditNote->pdf_url = $pdfUrl;
         $creditNote->xml_url = $xmlUrl;
         $creditNote->cdr_url = $cdrUrl;
 
-        $creditNote->pdf_path = file_exists(public_path('comprobantes/notas_credito/pdfs/' . $pdfFilename)) ? $pdfFilename : null;
-        $creditNote->xml_path = file_exists(public_path('comprobantes/notas_credito/xmls/' . $xmlFilename)) ? $xmlFilename : null;
-        $creditNote->cdr_path = file_exists(public_path('comprobantes/notas_credito/cdrs/' . $cdrFilename)) ? $cdrFilename : null;
-
+        /*
+        |--------------------------------------------------------------------------
+        | 3. DETERMINAR EL ESTADO REAL
+        |--------------------------------------------------------------------------
+        */
         if ($accepted) {
             $creditNote->status = 'accepted';
-            $creditNote->accepted_at = now();
-            $creditNote->sunat_status = 'Aceptado';
-            $creditNote->sunat_message = $finalMessage ?: 'Nota de Crédito aceptada por SUNAT.';
-        } elseif (!empty($soapError) || (!empty($responseCode) && $responseCode !== '0')) {
+
+            $creditNote->accepted_at =
+                $creditNote->accepted_at ?: now();
+
+            $creditNote->sunat_status =
+                'Aceptado';
+
+            $creditNote->sunat_message =
+                $finalMessage
+                    ?: 'Nota de Crédito aceptada por SUNAT.';
+
+        } elseif (
+            !empty($soapError) ||
+            (
+                !empty($responseCode) &&
+                (string) $responseCode !== '0'
+            )
+        ) {
             $creditNote->status = 'rejected';
-            $creditNote->sunat_status = 'Rechazado';
-            $creditNote->sunat_message = $finalMessage ?: 'SUNAT rechazó la Nota de Crédito.';
+
+            /*
+             * Si antes estuvo aceptada, no conservamos esa fecha.
+             */
+            $creditNote->accepted_at = null;
+
+            $creditNote->sunat_status =
+                'Rechazado';
+
+            $creditNote->sunat_message =
+                $finalMessage
+                    ?: 'SUNAT rechazó la Nota de Crédito.';
+
         } else {
             $creditNote->status = 'pending';
-            $creditNote->sunat_status = 'Pendiente';
-            $creditNote->sunat_message = $finalMessage ?: 'Nota de Crédito enviada a Nubefact. Pendiente de aceptación SUNAT.';
+
+            $creditNote->accepted_at = null;
+
+            $creditNote->sunat_status =
+                'Pendiente';
+
+            $creditNote->sunat_message =
+                $finalMessage
+                    ?: 'Nota de Crédito enviada a Nubefact. Pendiente de aceptación SUNAT.';
         }
 
+        /*
+         * Persistimos primero la respuesta y el estado.
+         */
         $creditNote->save();
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4. PREPARAR DIRECTORIOS Y ARCHIVOS
+        |--------------------------------------------------------------------------
+        */
+        $filename =
+            'NC_' . $creditNote->id;
+
+        $pdfFilename =
+            $filename . '.pdf';
+
+        $xmlFilename =
+            $filename . '.xml';
+
+        $cdrFilename =
+            $filename . '.zip';
+
+        $pdfDirectory =
+            public_path(
+                'comprobantes/notas_credito/pdfs'
+            );
+
+        $xmlDirectory =
+            public_path(
+                'comprobantes/notas_credito/xmls'
+            );
+
+        $cdrDirectory =
+            public_path(
+                'comprobantes/notas_credito/cdrs'
+            );
+
+        foreach (
+            [
+                $pdfDirectory,
+                $xmlDirectory,
+                $cdrDirectory,
+            ] as $directory
+        ) {
+            if (!is_dir($directory)) {
+                if (
+                    !mkdir($directory, 0755, true) &&
+                    !is_dir($directory)
+                ) {
+                    Log::error(
+                        'No se pudo crear directorio para Nota de Crédito',
+                        [
+                            'credit_note_id' =>
+                                $creditNote->id,
+
+                            'directory' =>
+                                $directory,
+                        ]
+                    );
+
+                    /*
+                     * No lanzamos excepción porque la respuesta
+                     * fiscal ya fue registrada.
+                     */
+                }
+            }
+        }
+
+        $pdfPath =
+            $pdfDirectory .
+            DIRECTORY_SEPARATOR .
+            $pdfFilename;
+
+        $xmlPath =
+            $xmlDirectory .
+            DIRECTORY_SEPARATOR .
+            $xmlFilename;
+
+        $cdrPath =
+            $cdrDirectory .
+            DIRECTORY_SEPARATOR .
+            $cdrFilename;
+
+        $filesToUpdate = [];
+
+        /*
+        |--------------------------------------------------------------------------
+        | 5. DESCARGAR PDF
+        |--------------------------------------------------------------------------
+        |
+        | Puede existir PDF incluso cuando SUNAT rechazó la nota.
+        | Se conserva únicamente como evidencia/auditoría.
+        */
+        if (
+            !empty($pdfUrl) &&
+            is_dir($pdfDirectory)
+        ) {
+            try {
+                $this->descargarArchivoNubefactSeguro(
+                    $pdfUrl,
+                    $pdfPath,
+                    'pdf'
+                );
+
+                $filesToUpdate['pdf_path'] =
+                    $pdfFilename;
+
+            } catch (\Throwable $e) {
+                Log::error(
+                    'Falló la descarga del PDF de Nota de Crédito',
+                    [
+                        'credit_note_id' =>
+                            $creditNote->id,
+
+                        'status' =>
+                            $creditNote->status,
+
+                        'url' =>
+                            $pdfUrl,
+
+                        'error' =>
+                            $e->getMessage(),
+                    ]
+                );
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 6. DESCARGAR XML
+        |--------------------------------------------------------------------------
+        */
+        if (
+            !empty($xmlUrl) &&
+            is_dir($xmlDirectory)
+        ) {
+            try {
+                $this->descargarArchivoNubefactSeguro(
+                    $xmlUrl,
+                    $xmlPath,
+                    'xml'
+                );
+
+                $filesToUpdate['xml_path'] =
+                    $xmlFilename;
+
+            } catch (\Throwable $e) {
+                Log::error(
+                    'Falló la descarga del XML de Nota de Crédito',
+                    [
+                        'credit_note_id' =>
+                            $creditNote->id,
+
+                        'status' =>
+                            $creditNote->status,
+
+                        'url' =>
+                            $xmlUrl,
+
+                        'error' =>
+                            $e->getMessage(),
+                    ]
+                );
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 7. DESCARGAR CDR
+        |--------------------------------------------------------------------------
+        |
+        | En una respuesta rechazada, el CDR puede ser importante
+        | porque contiene el código y mensaje de SUNAT.
+        */
+        if (
+            !empty($cdrUrl) &&
+            is_dir($cdrDirectory)
+        ) {
+            try {
+                $this->descargarArchivoNubefactSeguro(
+                    $cdrUrl,
+                    $cdrPath,
+                    'zip'
+                );
+
+                $filesToUpdate['cdr_path'] =
+                    $cdrFilename;
+
+            } catch (\Throwable $e) {
+                Log::error(
+                    'Falló la descarga del CDR de Nota de Crédito',
+                    [
+                        'credit_note_id' =>
+                            $creditNote->id,
+
+                        'status' =>
+                            $creditNote->status,
+
+                        'url' =>
+                            $cdrUrl,
+
+                        'error' =>
+                            $e->getMessage(),
+                    ]
+                );
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 8. GUARDAR SOLO LOS ARCHIVOS VALIDADOS
+        |--------------------------------------------------------------------------
+        */
+        if (!empty($filesToUpdate)) {
+            $creditNote->update(
+                $filesToUpdate
+            );
+        }
+
+        Log::info(
+            'Resultado de Nota de Crédito persistido',
+            [
+                'credit_note_id' =>
+                    $creditNote->id,
+
+                'sale_id' =>
+                    $creditNote->sale_id,
+
+                'status' =>
+                    $creditNote->status,
+
+                'sunat_responsecode' =>
+                    $creditNote->sunat_responsecode,
+
+                'serie' =>
+                    $creditNote->serie,
+
+                'numero' =>
+                    $creditNote->numero,
+
+                'pdf_downloaded' =>
+                    isset($filesToUpdate['pdf_path']),
+
+                'xml_downloaded' =>
+                    isset($filesToUpdate['xml_path']),
+
+                'cdr_downloaded' =>
+                    isset($filesToUpdate['cdr_path']),
+            ]
+        );
     }
 
     private function buildNubefactConsultCreditNoteData(CreditNote $creditNote): array
@@ -953,7 +2173,7 @@ trait NubefactTrait
         ];
     }
 
-    private function consultarNotaCreditoNubefact(CreditNote $creditNote): array
+    private function consultarNotaCreditoNubefactO(CreditNote $creditNote): array
     {
         $data = $this->buildNubefactConsultCreditNoteData($creditNote);
 
@@ -983,6 +2203,164 @@ trait NubefactTrait
                 is_array($result['errors'])
                     ? json_encode($result['errors'], JSON_UNESCAPED_UNICODE)
                     : $result['errors']
+            );
+        }
+
+        return $result;
+    }
+
+    private function consultarNotaCreditoNubefact(
+        CreditNote $creditNote
+    ): array {
+        $data = $this->buildNubefactConsultCreditNoteData(
+            $creditNote
+        );
+
+        $token = config('services.nubefact.token');
+        $url = config('services.nubefact.url');
+
+        if (!$token || !$url) {
+            throw new \RuntimeException(
+                'Faltan credenciales Nubefact.'
+            );
+        }
+
+        Log::info(
+            'Consultando Nota de Crédito en Nubefact',
+            [
+                'credit_note_id' => $creditNote->id,
+                'sale_id' => $creditNote->sale_id,
+                'payload' => $data,
+            ]
+        );
+
+        try {
+            $response = Http::withHeaders([
+                'Authorization' =>
+                    'Token token=' . $token,
+
+                'Accept' =>
+                    'application/json',
+
+                'Content-Type' =>
+                    'application/json',
+            ])
+                ->timeout(60)
+                ->post($url, $data);
+
+        } catch (\Throwable $e) {
+            Log::error(
+                'Error de conexión consultando Nota de Crédito',
+                [
+                    'credit_note_id' => $creditNote->id,
+                    'sale_id' => $creditNote->sale_id,
+                    'error' => $e->getMessage(),
+                ]
+            );
+
+            throw new \RuntimeException(
+                'No se pudo establecer conexión con Nubefact: ' .
+                $e->getMessage()
+            );
+        }
+
+        $result = $response->json();
+
+        if (!$response->successful()) {
+            $message = is_array($result)
+                ? json_encode(
+                    $result,
+                    JSON_UNESCAPED_UNICODE
+                )
+                : substr(
+                    $response->body(),
+                    0,
+                    1000
+                );
+
+            Log::error(
+                'Nubefact respondió error al consultar Nota de Crédito',
+                [
+                    'credit_note_id' => $creditNote->id,
+                    'sale_id' => $creditNote->sale_id,
+                    'http_status' => $response->status(),
+                    'response' => $message,
+                ]
+            );
+
+            throw new \RuntimeException(
+                'Nubefact respondió con HTTP ' .
+                $response->status() .
+                ': ' .
+                $message
+            );
+        }
+
+        if (!is_array($result)) {
+            Log::error(
+                'Nubefact devolvió una respuesta inválida al consultar Nota de Crédito',
+                [
+                    'credit_note_id' => $creditNote->id,
+                    'sale_id' => $creditNote->sale_id,
+                    'response' => substr(
+                        $response->body(),
+                        0,
+                        1000
+                    ),
+                ]
+            );
+
+            throw new \RuntimeException(
+                'Nubefact devolvió una respuesta inválida al consultar la Nota de Crédito.'
+            );
+        }
+
+        if (!empty($result['errors'])) {
+            $errors = is_array($result['errors'])
+                ? json_encode(
+                    $result['errors'],
+                    JSON_UNESCAPED_UNICODE
+                )
+                : (string) $result['errors'];
+
+            throw new \RuntimeException(
+                'Error desde Nubefact: ' . $errors
+            );
+        }
+
+        Log::info(
+            'Respuesta consulta Nota de Crédito Nubefact',
+            [
+                'credit_note_id' => $creditNote->id,
+                'sale_id' => $creditNote->sale_id,
+                'result' => $result,
+            ]
+        );
+
+        /*
+         * Algunas respuestas de Nubefact pueden traer la información
+         * real del comprobante dentro de "invoice".
+         */
+        if (
+            isset($result['invoice']) &&
+            is_array($result['invoice'])
+        ) {
+            $result = array_merge(
+                $result,
+                $result['invoice']
+            );
+        }
+
+        /*
+         * Compatibilidad defensiva por si la respuesta viene dentro de "data".
+         */
+        if (
+            isset($result['data']) &&
+            is_array($result['data'])
+        ) {
+            $result = array_merge(
+                $result,
+                $result['data']
             );
         }
 
@@ -1060,7 +2438,7 @@ trait NubefactTrait
             "tipo_de_comprobante" => "3",
             "serie" => $serieNotaCredito,
             "numero" => "",
-            "codigo_unico" => 'NC-PARCIAL-' . $sale->id . '-' . now()->timestamp . '-' . \Illuminate\Support\Str::random(8),
+            "codigo_unico" => 'NC-PARCIAL-' . $sale->id . '-' . now()->timestamp . '-' . Str::random(8),
 
             "sunat_transaction" => "1",
 

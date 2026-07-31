@@ -8,6 +8,7 @@ use App\CashMovement;
 use App\CashRegister;
 use App\Customer;
 use App\DataGeneral;
+use App\Http\Controllers\Traits\FreeSaleFinancialReversalTrait;
 use App\Http\Controllers\Traits\NubefactTrait;
 use App\Http\Requests\StoreFreeSaleRequest;
 use App\Sale;
@@ -16,6 +17,8 @@ use App\Worker;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Http\Request;
 use Illuminate\Validation\ValidationException;
 use App\SalePartialPayment;
 
@@ -23,6 +26,7 @@ class FreeSaleController extends Controller
 {
 
     use NubefactTrait;
+    use FreeSaleFinancialReversalTrait;
 
     public function __construct()
     {
@@ -1401,10 +1405,7 @@ class FreeSaleController extends Controller
         }
     }
 
-    private function reverseFreeSaleFinancially(
-        Sale $sale,
-        string $reason
-    ) {
+    private function reverseFreeSaleFinanciallyO(Sale $sale,string $reason) {
         /*
          * Idempotencia a nivel de Sale.
          */
@@ -1513,11 +1514,7 @@ class FreeSaleController extends Controller
         $sale->save();
     }
 
-    private function reverseFreeSaleCashMovement(
-        CashMovement $originalMovement,
-        Sale $sale,
-        string $reason
-    ) {
+    private function reverseFreeSaleCashMovementO(CashMovement $originalMovement,Sale $sale,string $reason) {
         /*
          * No revertimos movimientos que ya son, a su vez,
          * movimientos compensatorios.
@@ -1690,11 +1687,7 @@ class FreeSaleController extends Controller
         $cashRegister->save();
     }
 
-    private function setFreeSaleAnnulmentRequestData(
-        Sale $sale,
-        string $reason,
-        string $type
-    ) {
+    private function setFreeSaleAnnulmentRequestData(Sale $sale,string $reason,string $type) {
         $sale->annulment_status = 'pending';
         $sale->annulment_type = $type;
         $sale->annulment_reason = $reason;
@@ -1703,10 +1696,7 @@ class FreeSaleController extends Controller
         $sale->save();
     }
 
-    private function markFreeSaleAnnulmentAccepted(
-        Sale $sale,
-        string $type
-    ) {
+    private function markFreeSaleAnnulmentAccepted(Sale $sale,string $type) {
         $sale->state_annulled = 1;
         $sale->annulment_status = 'accepted';
         $sale->annulment_type = $type;
@@ -1826,6 +1816,576 @@ class FreeSaleController extends Controller
             return response()->json([
                 'message' =>
                     'No se pudo consultar la anulación: ' .
+                    $e->getMessage(),
+            ], 422);
+        }
+    }
+
+    public function generateInvoice(Request $request)
+    {
+        /*
+        |--------------------------------------------------------------------------
+        | VALIDACIÓN INICIAL
+        |--------------------------------------------------------------------------
+        */
+        $request->validate([
+            'sale_id' => [
+                'required',
+                'integer',
+                'exists:sales,id',
+            ],
+
+            'tipo_comprobante' => [
+                'required',
+                'in:boleta,factura',
+            ],
+
+            'dni' => [
+                'nullable',
+                'string',
+                'max:8',
+            ],
+
+            'name' => [
+                'nullable',
+                'string',
+                'max:200',
+            ],
+
+            'email_boleta' => [
+                'nullable',
+                'email',
+                'max:150',
+            ],
+
+            'ruc' => [
+                'nullable',
+                'string',
+                'max:11',
+            ],
+
+            'razon_social' => [
+                'nullable',
+                'string',
+                'max:200',
+            ],
+
+            'direccion_fiscal' => [
+                'nullable',
+                'string',
+                'max:250',
+            ],
+
+            'email_factura' => [
+                'nullable',
+                'email',
+                'max:150',
+            ],
+        ]);
+
+        $sale = null;
+
+        try {
+            /*
+            |--------------------------------------------------------------------------
+            | 1. VALIDAR Y PREPARAR LA VENTA
+            |--------------------------------------------------------------------------
+            |
+            | Esta transacción solo bloquea la venta mientras validamos
+            | y actualizamos los datos fiscales.
+            |
+            | La llamada HTTP a Nubefact se hará fuera de la transacción.
+            */
+            $sale = DB::transaction(function () use ($request) {
+                $sale = Sale::query()
+                    ->with([
+                        'details.material',
+                        'details.stockItem',
+                    ])
+                    ->where('free_sale', true)
+                    ->lockForUpdate()
+                    ->find($request->input('sale_id'));
+
+                if (!$sale) {
+                    throw ValidationException::withMessages([
+                        'sale_id' =>
+                            'La venta libre no fue encontrada.',
+                    ]);
+                }
+
+                /*
+                 * No se puede generar comprobante para una venta anulada.
+                 */
+                if ((int) $sale->state_annulled === 1) {
+                    throw ValidationException::withMessages([
+                        'sale_id' =>
+                            'No puede generar un comprobante para una venta libre anulada.',
+                    ]);
+                }
+
+                /*
+                 * Tampoco debe tener una anulación activa o una solicitud
+                 * que requiera nota de crédito.
+                 */
+                if (
+                in_array(
+                    $sale->annulment_status,
+                    [
+                        'pending',
+                        'waiting_sunat_process',
+                        'accepted',
+                        'requires_credit_note',
+                    ],
+                    true
+                )
+                ) {
+                    throw ValidationException::withMessages([
+                        'sale_id' =>
+                            'La venta libre tiene un proceso de anulación y no puede generar un comprobante.',
+                    ]);
+                }
+
+                /*
+                 * Si ya tiene factura o boleta válida, no permitimos generar otra.
+                 *
+                 * Cuando sunat_status es Error sí permitimos reintentar.
+                 */
+                if (
+                    in_array(
+                        $sale->type_document,
+                        ['01', '03'],
+                        true
+                    ) &&
+                    $sale->sunat_status !== 'Error'
+                ) {
+                    throw ValidationException::withMessages([
+                        'sale_id' =>
+                            'Esta venta libre ya tiene un comprobante generado.',
+                    ]);
+                }
+
+                /*
+                 * La venta debe tener conceptos.
+                 */
+                if ($sale->details->isEmpty()) {
+                    throw ValidationException::withMessages([
+                        'sale_id' =>
+                            'La venta libre no contiene conceptos para facturar.',
+                    ]);
+                }
+
+                /*
+                 * Validamos la consistencia de todos los detalles.
+                 */
+                foreach ($sale->details as $detail) {
+                    $description = trim(
+                        (string) $detail->description
+                    );
+
+                    if (
+                        empty($detail->material_id) &&
+                        $description === ''
+                    ) {
+                        throw ValidationException::withMessages([
+                            'sale_id' =>
+                                'Uno de los conceptos de la venta libre no tiene descripción.',
+                        ]);
+                    }
+
+                    if ((float) $detail->quantity <= 0) {
+                        throw ValidationException::withMessages([
+                            'sale_id' =>
+                                'Uno de los conceptos tiene una cantidad inválida.',
+                        ]);
+                    }
+
+                    if ((float) $detail->price < 0) {
+                        throw ValidationException::withMessages([
+                            'sale_id' =>
+                                'Uno de los conceptos tiene un precio inválido.',
+                        ]);
+                    }
+
+                    if ((float) $detail->total < 0) {
+                        throw ValidationException::withMessages([
+                            'sale_id' =>
+                                'Uno de los conceptos tiene un total inválido.',
+                        ]);
+                    }
+
+                    if (
+                        is_null($detail->valor_unitario) ||
+                        (float) $detail->valor_unitario < 0
+                    ) {
+                        throw ValidationException::withMessages([
+                            'sale_id' =>
+                                'Uno de los conceptos no tiene un valor unitario válido.',
+                        ]);
+                    }
+                }
+
+                /*
+                 * Validación de totales principales.
+                 */
+                if ((float) $sale->importe_total <= 0) {
+                    throw ValidationException::withMessages([
+                        'sale_id' =>
+                            'La venta libre no tiene un importe total válido.',
+                    ]);
+                }
+
+                if ((float) $sale->op_gravada < 0) {
+                    throw ValidationException::withMessages([
+                        'sale_id' =>
+                            'La operación gravada de la venta no es válida.',
+                    ]);
+                }
+
+                if ((float) $sale->igv < 0) {
+                    throw ValidationException::withMessages([
+                        'sale_id' =>
+                            'El IGV de la venta no es válido.',
+                    ]);
+                }
+
+                $tipoComprobante = $request->input(
+                    'tipo_comprobante'
+                );
+
+                /*
+                |--------------------------------------------------------------------------
+                | BOLETA
+                |--------------------------------------------------------------------------
+                */
+                if ($tipoComprobante === 'boleta') {
+                    $documentNumber = preg_replace(
+                        '/\D/',
+                        '',
+                        (string) $request->input('dni')
+                    );
+
+                    $customerName = trim(
+                        (string) $request->input('name')
+                    );
+
+                    $email = trim(
+                        (string) $request->input(
+                            'email_boleta'
+                        )
+                    );
+
+                    if (
+                    !preg_match(
+                        '/^\d{8}$/',
+                        $documentNumber
+                    )
+                    ) {
+                        throw ValidationException::withMessages([
+                            'dni' =>
+                                'Ingrese un DNI válido de 8 dígitos.',
+                        ]);
+                    }
+
+                    if ($customerName === '') {
+                        throw ValidationException::withMessages([
+                            'name' =>
+                                'Ingrese o consulte el nombre del cliente.',
+                        ]);
+                    }
+
+                    $sale->type_document = '03';
+
+                    $sale->tipo_documento_cliente = '1';
+
+                    $sale->numero_documento_cliente =
+                        $documentNumber;
+
+                    $sale->nombre_cliente =
+                        $customerName;
+
+                    /*
+                     * Conservamos la dirección histórica de la venta.
+                     * Para boleta no es obligatorio eliminarla.
+                     */
+                    $sale->email_cliente =
+                        $email !== '' ? $email : null;
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | FACTURA
+                |--------------------------------------------------------------------------
+                */
+                if ($tipoComprobante === 'factura') {
+                    $documentNumber = preg_replace(
+                        '/\D/',
+                        '',
+                        (string) $request->input('ruc')
+                    );
+
+                    $businessName = trim(
+                        (string) $request->input(
+                            'razon_social'
+                        )
+                    );
+
+                    $fiscalAddress = trim(
+                        (string) $request->input(
+                            'direccion_fiscal'
+                        )
+                    );
+
+                    $email = trim(
+                        (string) $request->input(
+                            'email_factura'
+                        )
+                    );
+
+                    if (
+                    !preg_match(
+                        '/^\d{11}$/',
+                        $documentNumber
+                    )
+                    ) {
+                        throw ValidationException::withMessages([
+                            'ruc' =>
+                                'Ingrese un RUC válido de 11 dígitos.',
+                        ]);
+                    }
+
+                    if ($businessName === '') {
+                        throw ValidationException::withMessages([
+                            'razon_social' =>
+                                'Ingrese o consulte la razón social.',
+                        ]);
+                    }
+
+                    if ($fiscalAddress === '') {
+                        throw ValidationException::withMessages([
+                            'direccion_fiscal' =>
+                                'Ingrese o consulte la dirección fiscal.',
+                        ]);
+                    }
+
+                    $sale->type_document = '01';
+
+                    $sale->tipo_documento_cliente = '6';
+
+                    $sale->numero_documento_cliente =
+                        $documentNumber;
+
+                    $sale->nombre_cliente =
+                        $businessName;
+
+                    $sale->direccion_cliente =
+                        $fiscalAddress;
+
+                    $sale->email_cliente =
+                        $email !== '' ? $email : null;
+                }
+
+                /*
+                 * Limpiamos el error anterior para permitir un nuevo intento.
+                 *
+                 * No eliminamos serie_sunat ni numero aquí porque normalmente
+                 * estarán vacíos cuando hubo un error de generación.
+                 */
+                $sale->sunat_status = null;
+                $sale->sunat_message = null;
+
+                $sale->save();
+
+                return $sale;
+            }, 3);
+
+            /*
+            |--------------------------------------------------------------------------
+            | 2. GENERAR COMPROBANTE EN NUBEFACT
+            |--------------------------------------------------------------------------
+            |
+            | Esta llamada se ejecuta fuera de la transacción para no mantener
+            | bloqueada la fila mientras esperamos la respuesta HTTP.
+            */
+            try {
+                $sale->loadMissing([
+                    'details.material',
+                    'details.stockItem',
+                ]);
+
+                $nubefactResult =
+                    $this->generarComprobanteNubefactParaVenta(
+                        $sale
+                    );
+
+                /*
+                 * Este método:
+                 *
+                 * 1. Guarda serie, número y estado SUNAT.
+                 * 2. Intenta descargar PDF, XML y CDR.
+                 * 3. Devuelve advertencias cuando algún archivo falla.
+                 */
+                $fileResult =
+                    $this->persistNubefactFilesAndUpdateSale(
+                        $sale,
+                        $nubefactResult
+                    );
+
+            } catch (\Throwable $e) {
+                Log::error(
+                    'Error generando comprobante de venta libre',
+                    [
+                        'sale_id' => $sale->id,
+                        'error' => $e->getMessage(),
+                    ]
+                );
+
+                /*
+                 * Si ya existe serie y número, significa que el comprobante
+                 * pudo haber sido registrado antes de que fallara otra operación.
+                 * Evitamos convertirlo incorrectamente en Error.
+                 */
+                $sale->refresh();
+
+                if (
+                    empty($sale->serie_sunat) ||
+                    empty($sale->numero)
+                ) {
+                    $sale->update([
+                        'sunat_status' => 'Error',
+                        'sunat_message' => $e->getMessage(),
+                    ]);
+                }
+
+                return response()->json([
+                    'message' =>
+                        'No se pudo generar el comprobante de la venta libre: ' .
+                        $e->getMessage(),
+                ], 422);
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | 3. PREPARAR RESPUESTA
+            |--------------------------------------------------------------------------
+            */
+            $sale->refresh();
+
+            $urlPrint = route(
+                'puntoVenta.print',
+                $sale->id
+            );
+
+            $printType = 'ticket';
+            $pdfAvailable = false;
+
+            /*
+             * Prioridad 1: PDF local validado.
+             */
+            if (!empty($sale->pdf_path)) {
+                $localPath = public_path(
+                    'comprobantes/pdfs/' .
+                    $sale->pdf_path
+                );
+
+                if (file_exists($localPath)) {
+                    $urlPrint = asset(
+                        'comprobantes/pdfs/' .
+                        $sale->pdf_path
+                    );
+
+                    $printType = 'sunat_pdf';
+                    $pdfAvailable = true;
+                }
+            }
+
+            /*
+             * Prioridad 2: enlace remoto devuelto por Nubefact.
+             *
+             * Solo lo usamos si no tenemos un PDF local.
+             */
+            if (
+                !$pdfAvailable &&
+                !empty(
+                $nubefactResult['enlace_del_pdf']
+                )
+            ) {
+                $urlPrint =
+                    $nubefactResult['enlace_del_pdf'];
+
+                $printType = 'sunat_pdf_remote';
+                $pdfAvailable = true;
+            }
+
+            $message =
+                'Comprobante de la venta libre generado correctamente.';
+
+            if (
+                !empty($fileResult['errores']) &&
+                is_array($fileResult['errores'])
+            ) {
+                $message .=
+                    ' El comprobante fue emitido, pero algunos archivos no pudieron descargarse localmente.';
+            }
+
+            return response()->json([
+                'message' => $message,
+
+                'sale_id' => $sale->id,
+
+                'url_print' => $urlPrint,
+                'print_type' => $printType,
+                'pdf_available' => $pdfAvailable,
+
+                'type_document' =>
+                    $sale->type_document,
+
+                'serie_sunat' =>
+                    $sale->serie_sunat,
+
+                'numero' =>
+                    $sale->numero,
+
+                'sunat_status' =>
+                    $sale->sunat_status,
+
+                'sunat_message' =>
+                    $sale->sunat_message,
+
+                'files' => [
+                    'pdf' => !empty(
+                    $fileResult['pdf_descargado']
+                    ),
+
+                    'xml' => !empty(
+                    $fileResult['xml_descargado']
+                    ),
+
+                    'cdr' => !empty(
+                    $fileResult['cdr_descargado']
+                    ),
+                ],
+
+                'file_warnings' =>
+                    isset($fileResult['errores'])
+                        ? $fileResult['errores']
+                        : [],
+            ], 200);
+
+        } catch (ValidationException $e) {
+            throw $e;
+
+        } catch (\Throwable $e) {
+            Log::error(
+                'Error inesperado generando comprobante de venta libre',
+                [
+                    'sale_id' => $request->input('sale_id'),
+                    'error' => $e->getMessage(),
+                ]
+            );
+
+            return response()->json([
+                'message' =>
+                    'No se pudo generar el comprobante de la venta libre: ' .
                     $e->getMessage(),
             ], 422);
         }

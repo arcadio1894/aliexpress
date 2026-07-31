@@ -13,6 +13,7 @@ use App\CreditNoteDetail;
 use App\CreditNoteDetailItem;
 use App\Customer;
 use App\DataGeneral;
+use App\Http\Controllers\Traits\FreeSaleFinancialReversalTrait;
 use App\Http\Controllers\Traits\NubefactTrait;
 use App\InventoryLevel;
 use App\Item;
@@ -48,10 +49,12 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Barryvdh\DomPDF\Facade as PDF;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Str;
 
 class PuntoVentaController extends Controller
 {
     use NubefactTrait;
+    use FreeSaleFinancialReversalTrait;
 
     /** @var InventoryCostService */
     private $inventoryCostService;
@@ -3483,11 +3486,86 @@ class PuntoVentaController extends Controller
                 ->latest()
                 ->first();
 
+            $acceptedCreditNotePdfUrl = null;
+            $acceptedCreditNoteXmlUrl = null;
+            $acceptedCreditNoteCdrUrl = null;
+
+            if (
+                $acceptedCreditNote &&
+                $acceptedCreditNote->status === 'accepted'
+            ) {
+                if (!empty($acceptedCreditNote->pdf_path)) {
+                    $pdfPath = public_path(
+                        'comprobantes/notas_credito/pdfs/' .
+                        $acceptedCreditNote->pdf_path
+                    );
+
+                    if (is_file($pdfPath)) {
+                        $acceptedCreditNotePdfUrl = asset(
+                            'comprobantes/notas_credito/pdfs/' .
+                            $acceptedCreditNote->pdf_path
+                        );
+                    }
+                }
+
+                if (!empty($acceptedCreditNote->xml_path)) {
+                    $xmlPath = public_path(
+                        'comprobantes/notas_credito/xmls/' .
+                        $acceptedCreditNote->xml_path
+                    );
+
+                    if (is_file($xmlPath)) {
+                        $acceptedCreditNoteXmlUrl = asset(
+                            'comprobantes/notas_credito/xmls/' .
+                            $acceptedCreditNote->xml_path
+                        );
+                    }
+                }
+
+                if (!empty($acceptedCreditNote->cdr_path)) {
+                    $cdrPath = public_path(
+                        'comprobantes/notas_credito/cdrs/' .
+                        $acceptedCreditNote->cdr_path
+                    );
+
+                    if (is_file($cdrPath)) {
+                        $acceptedCreditNoteCdrUrl = asset(
+                            'comprobantes/notas_credito/cdrs/' .
+                            $acceptedCreditNote->cdr_path
+                        );
+                    }
+                }
+            }
+
             $acceptedPartialCreditNote = $sale->creditNotes()
                 ->where('status', 'accepted')
                 ->where('credit_note_type', 'partial')
                 ->latest()
                 ->first();
+
+            $acceptedPartialCreditNotePdfUrl = null;
+
+            if (
+                $acceptedPartialCreditNote &&
+                !empty($acceptedPartialCreditNote->pdf_path)
+            ) {
+                $partialPdfPath = public_path(
+                    'comprobantes/notas_credito/pdfs/' .
+                    $acceptedPartialCreditNote->pdf_path
+                );
+
+                if (is_file($partialPdfPath)) {
+                    $acceptedPartialCreditNotePdfUrl = asset(
+                        'comprobantes/notas_credito/pdfs/' .
+                        $acceptedPartialCreditNote->pdf_path
+                    );
+                }
+            }
+
+            $hasAnyCreditNote =
+                !is_null($pendingCreditNote) ||
+                !is_null($rejectedCreditNote) ||
+                !is_null($acceptedCreditNote);
 
             array_push($arraySales, [
                 "id" => $sale->id,
@@ -3531,7 +3609,8 @@ class PuntoVentaController extends Controller
                 "estado_anulacion" => $estadoAnulacion,
                 "estado_comprobante" => $estadoComprobante,
                 "can_annul" => (int) $sale->state_annulled !== 1,
-                "can_generate_credit_note" => $sale->annulment_status === 'requires_credit_note',
+                /*"can_generate_credit_note" => $sale->annulment_status === 'requires_credit_note',*/
+                "can_generate_credit_note" => $sale->annulment_status === 'requires_credit_note' && !$hasAnyCreditNote,
                 "can_retry_annulment" => in_array($sale->annulment_status, ['waiting_sunat_process', 'rejected']),
 
                 "is_annulled" => (int) $sale->state_annulled,
@@ -3554,12 +3633,19 @@ class PuntoVentaController extends Controller
                 'has_pending_credit_note' => !is_null($pendingCreditNote),
                 'pending_credit_note_id' => optional($pendingCreditNote)->id,
 
+                /*"has_rejected_credit_note" => !is_null($rejectedCreditNote),
+                "rejected_credit_note_message" => optional($rejectedCreditNote)->sunat_message,*/
                 "has_rejected_credit_note" => !is_null($rejectedCreditNote),
-                "rejected_credit_note_message" => optional($rejectedCreditNote)->sunat_message,
+
+                "rejected_credit_note_id" => optional($rejectedCreditNote)->id,
+
+                "rejected_credit_note_responsecode" => optional($rejectedCreditNote)->sunat_responsecode,
+
+                "rejected_credit_note_message" => $this->cleanUtf8( optional($rejectedCreditNote)->sunat_message ),
 
                 "is_credit_note_annulment" => !is_null($acceptedCreditNote),
 
-                "credit_note_pdf_url_local" => $acceptedCreditNote && $acceptedCreditNote->pdf_path
+                /*"credit_note_pdf_url_local" => $acceptedCreditNote && $acceptedCreditNote->pdf_path
                     ? asset('comprobantes/notas_credito/pdfs/' . $acceptedCreditNote->pdf_path)
                     : null,
 
@@ -3569,15 +3655,21 @@ class PuntoVentaController extends Controller
 
                 "credit_note_cdr_url_local" => $acceptedCreditNote && $acceptedCreditNote->cdr_path
                     ? asset('comprobantes/notas_credito/cdrs/' . $acceptedCreditNote->cdr_path)
-                    : null,
+                    : null,*/
+                "credit_note_pdf_url_local" => $acceptedCreditNotePdfUrl,
+
+                "credit_note_xml_url_local" => $acceptedCreditNoteXmlUrl,
+
+                "credit_note_cdr_url_local" => $acceptedCreditNoteCdrUrl,
 
                 "credit_note_status" => $sale->credit_note_status,
 
                 "has_partial_credit_note" => !is_null($acceptedPartialCreditNote),
 
-                "partial_credit_note_pdf_url_local" => $acceptedPartialCreditNote && $acceptedPartialCreditNote->pdf_path
+                /*"partial_credit_note_pdf_url_local" => $acceptedPartialCreditNote && $acceptedPartialCreditNote->pdf_path
                     ? asset('comprobantes/notas_credito/pdfs/' . $acceptedPartialCreditNote->pdf_path)
-                    : null,
+                    : null,*/
+                "partial_credit_note_pdf_url_local" => $acceptedPartialCreditNotePdfUrl,
 
                 "sunat_error_discarded_at" => $sale->sunat_error_discarded_at
                     ? Carbon::parse($sale->sunat_error_discarded_at)->format('d/m/Y h:i A')
@@ -5039,7 +5131,10 @@ class PuntoVentaController extends Controller
         DB::beginTransaction();
 
         try {
-            $sale = Sale::with(['details'])
+            $sale = Sale::with([
+                'details.material',
+                'details.stockItem',
+            ])
                 ->lockForUpdate()
                 ->find($id);
 
@@ -5061,14 +5156,71 @@ class PuntoVentaController extends Controller
                 ], 422);
             }
 
-            $existing = CreditNote::where('sale_id', $sale->id)
-                ->whereIn('status', ['pending', 'accepted', 'rejected'])
-                ->latest()
+            $existing = CreditNote::query()
+                ->where('sale_id', $sale->id)
+                ->whereIn(
+                    'status',
+                    [
+                        'pending',
+                        'accepted',
+                        'rejected',
+                    ]
+                )
+                ->latest('id')
+                ->lockForUpdate()
                 ->first();
 
             if ($existing) {
+                $statusLabels = [
+                    'pending' => 'pendiente',
+                    'accepted' => 'aceptada',
+                    'rejected' => 'rechazada',
+                ];
+
+                $statusLabel =
+                    $statusLabels[$existing->status]
+                    ?? $existing->status;
+
+                $message =
+                    'Esta venta ya tiene una Nota de Crédito ' .
+                    $statusLabel .
+                    ' registrada con el código interno #' .
+                    $existing->id .
+                    '.';
+
+                if (
+                    $existing->status === 'rejected' &&
+                    !empty($existing->sunat_responsecode)
+                ) {
+                    $message .=
+                        ' Código SUNAT: ' .
+                        $existing->sunat_responsecode .
+                        '.';
+                }
+
+                if (
+                    $existing->status === 'rejected' &&
+                    !empty($existing->sunat_message)
+                ) {
+                    $message .=
+                        ' Motivo: ' .
+                        $existing->sunat_message;
+                }
+
                 return response()->json([
-                    'message' => 'Esta venta ya tiene una Nota de Crédito registrada. Revise su estado antes de generar otra.',
+                    'message' => $message,
+
+                    'credit_note_id' =>
+                        $existing->id,
+
+                    'credit_note_status' =>
+                        $existing->status,
+
+                    'sunat_responsecode' =>
+                        $existing->sunat_responsecode,
+
+                    'sunat_message' =>
+                        $existing->sunat_message,
                 ], 422);
             }
 
@@ -5084,11 +5236,12 @@ class PuntoVentaController extends Controller
                 'total_descuentos' => $sale->total_descuentos,
                 'importe_total' => $sale->importe_total,
                 'credit_note_type' => 'total',
+                'generation_key' => (string) Str::uuid(),
                 'status' => 'pending',
                 'created_by' => auth()->id(),
             ]);
 
-            foreach ($sale->details as $detail) {
+            /*foreach ($sale->details as $detail) {
                 $quantity = (float) $detail->quantity;
                 $price = (float) $detail->price;
                 $valorUnitario = (float) $detail->valor_unitario;
@@ -5108,6 +5261,56 @@ class PuntoVentaController extends Controller
                     'igv' => round($igv, 2),
                     'total' => round($total, 2),
                 ]);
+            }*/
+            foreach ($sale->details as $detail) {
+                $quantity = (float) $detail->quantity;
+                $price = (float) $detail->price;
+                $valorUnitario = (float) $detail->valor_unitario;
+                $total = (float) $detail->total;
+
+                $subtotal = $valorUnitario * $quantity;
+
+                /*
+                 * Venta Libre:
+                 * utilizar el IGV explícito guardado en SaleDetail.
+                 *
+                 * Venta normal:
+                 * conservar el cálculo histórico.
+                 */
+                if (
+                    (bool) $sale->free_sale &&
+                    !is_null($detail->tax_amount)
+                ) {
+                    $igv = (float) $detail->tax_amount;
+                } else {
+                    $igv = $total - $subtotal;
+                }
+
+                $description = trim(
+                    (string) $detail->description
+                );
+
+                if ($description === '') {
+                    $description =
+                        optional($detail->stockItem)->display_name
+                        ?? optional($detail->material)->full_name
+                        ?? 'Producto';
+                }
+
+                CreditNoteDetail::create([
+                    'credit_note_id' => $creditNote->id,
+                    'sale_detail_id' => $detail->id,
+
+                    'description' => $description,
+
+                    'quantity' => $quantity,
+                    'price' => $price,
+                    'valor_unitario' => $valorUnitario,
+
+                    'subtotal' => round($subtotal, 2),
+                    'igv' => round($igv, 2),
+                    'total' => round($total, 2),
+                ]);
             }
 
             $result = $this->generarNotaCreditoNubefact($sale, $creditNote);
@@ -5121,7 +5324,10 @@ class PuntoVentaController extends Controller
              * aunque SUNAT quede pendiente, liberamos stock/caja.
              * state_annulled queda en 0 hasta aceptación SUNAT.
              */
-            $this->applyCreditNoteInternalReversal($creditNote);
+            $this->applyTotalCreditNoteReversal(
+                $sale,
+                $creditNote
+            );
 
             $sale->refresh();
             $creditNote->refresh();
@@ -5205,7 +5411,11 @@ class PuntoVentaController extends Controller
                  * Si por algún motivo aún no se aplicó la reversión operativa,
                  * se aplica aquí. Si ya se aplicó, no duplica nada.
                  */
-                $this->applyCreditNoteInternalReversal($creditNote);
+                //$this->applyCreditNoteInternalReversal($creditNote);
+                $this->applyTotalCreditNoteReversal(
+                    $sale,
+                    $creditNote
+                );
 
                 $creditNote->refresh();
                 $sale->refresh();
@@ -5264,9 +5474,20 @@ class PuntoVentaController extends Controller
                 DB::commit();
 
                 return response()->json([
-                    'message' => $creditNote->sunat_message ?: 'La Nota de Crédito fue rechazada por SUNAT. Revise el caso manualmente.',
+                    'message' =>
+                        $creditNote->sunat_message
+                            ?: 'La Nota de Crédito fue rechazada por SUNAT.',
+
                     'credit_note_status' => 'rejected',
-                    'credit_note_type' => $creditNote->credit_note_type,
+
+                    'credit_note_type' =>
+                        $creditNote->credit_note_type,
+
+                    'sunat_responsecode' =>
+                        $creditNote->sunat_responsecode,
+
+                    'sunat_message' =>
+                        $creditNote->sunat_message,
                 ], 422);
             }
 
@@ -6419,6 +6640,8 @@ class PuntoVentaController extends Controller
 
                 'can_retry_invoice' => true,
                 'can_discard_error' => true,
+
+
             ]);
         }
 
@@ -6800,5 +7023,46 @@ class PuntoVentaController extends Controller
                 ],
             ], 422);
         }
+    }
+
+    private function applyTotalCreditNoteReversal(Sale $sale,CreditNote $creditNote) {
+        /*
+         * Idempotencia de la Nota de Crédito.
+         */
+        if (
+            $creditNote->internal_reversal_status ===
+            'reversed'
+        ) {
+            return;
+        }
+
+        if ((bool) $sale->free_sale) {
+            /*
+             * Venta libre:
+             * no tocar inventario, Output ni OutputDetail.
+             */
+            $this->reverseFreeSaleFinancially(
+                $sale,
+                'Reversión financiera por Nota de Crédito total #' .
+                $creditNote->id
+            );
+
+            $creditNote->internal_reversal_status =
+                'reversed';
+
+            $creditNote->internal_reversed_at = now();
+            $creditNote->internal_reversed_by = auth()->id();
+            $creditNote->save();
+
+            return;
+        }
+
+        /*
+         * Venta normal:
+         * conserva la reversión actual de inventario y caja.
+         */
+        $this->applyCreditNoteInternalReversal(
+            $creditNote
+        );
     }
 }

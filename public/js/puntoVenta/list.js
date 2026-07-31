@@ -708,7 +708,7 @@ $(document).ready(function () {
             }
 
             const url = isFreeSale
-                ? '/dashboard/free-sale/generate-invoice'
+                ? '/dashboard/ventas-libres/generate-invoice'
                 : '/dashboard/sale/generate-invoice';
 
             const tipoVentaText = isFreeSale
@@ -940,6 +940,8 @@ $(document).ready(function () {
                 : '/dashboard/consultar/anulacion/' +
                 saleId;
 
+        showProcessLoader('Estamos consultando el comprobante a SUNAT...');
+
             $.ajax({
                 url: url,
                 method: 'POST',
@@ -1011,7 +1013,11 @@ $(document).ready(function () {
                             }
                         }
                     });
+                },
+                complete: function () {
+                    hideProcessLoader();
                 }
+
             });
         }
     );
@@ -1028,6 +1034,7 @@ $(document).ready(function () {
                     text: 'Sí, generar',
                     btnClass: 'btn-warning',
                     action: function () {
+                        showProcessLoader('Estamos generando el comprobante en SUNAT...');
                         $.ajax({
                             url: '/dashboard/generar/nota-credito/total/' + saleId,
                             method: 'POST',
@@ -1052,25 +1059,70 @@ $(document).ready(function () {
                                 reloadCurrentPageOrders();
                             },
                             error: function (xhr) {
-                                let message = 'No se pudo generar la Nota de Crédito.';
+                                const response =
+                                    xhr.responseJSON || {};
 
-                                if (xhr.responseJSON && xhr.responseJSON.message) {
-                                    message = xhr.responseJSON.message;
+                                let content = escapeHtml(
+                                    response.message ||
+                                    'No se pudo generar la Nota de Crédito.'
+                                );
+
+                                if (
+                                    response.sunat_responsecode &&
+                                    !String(content).includes(
+                                        String(response.sunat_responsecode)
+                                    )
+                                ) {
+                                    content = `
+            <div class="mb-2">
+                <strong>Código SUNAT:</strong>
+                <span class="badge badge-danger">
+                    ${escapeHtml(
+                                        String(
+                                            response.sunat_responsecode
+                                        )
+                                    )}
+                </span>
+            </div>
+
+            <div>
+                ${content}
+            </div>
+        `;
                                 }
 
                                 $.alert({
-                                    title: 'Aviso',
-                                    content: message,
-                                    type: 'orange',
+                                    title:
+                                        response.credit_note_status === 'rejected'
+                                            ? 'Nota de Crédito rechazada'
+                                            : 'No se pudo generar la Nota de Crédito',
+
+                                    content: content,
+
+                                    type:
+                                        response.credit_note_status === 'rejected'
+                                            ? 'red'
+                                            : 'orange',
+
                                     buttons: {
                                         ok: {
                                             text: 'Entendido',
-                                            btnClass: 'btn-warning'
+
+                                            btnClass:
+                                                response.credit_note_status ===
+                                                'rejected'
+                                                    ? 'btn-danger'
+                                                    : 'btn-warning',
+
+                                            action: function () {
+                                                reloadCurrentPageOrders();
+                                            }
                                         }
                                     }
                                 });
-
-                                reloadCurrentPageOrders();
+                            },
+                            complete: function () {
+                                hideProcessLoader();
                             }
                         });
                     }
@@ -1096,40 +1148,89 @@ $(document).ready(function () {
             processData: false,
             contentType: false,
             success: function (data) {
+                const isPending =
+                    data.credit_note_status === 'pending';
+
                 $.alert({
-                    title: 'Consulta realizada',
+                    title: isPending
+                        ? 'Nota de Crédito pendiente'
+                        : 'Consulta realizada',
+
                     content: data.message,
-                    type: 'green',
+
+                    type: isPending
+                        ? 'orange'
+                        : 'green',
+
                     buttons: {
                         ok: {
                             text: 'Aceptar',
-                            btnClass: 'btn-success'
+
+                            btnClass: isPending
+                                ? 'btn-warning'
+                                : 'btn-success',
+
+                            action: function () {
+                                reloadCurrentPageOrders();
+                            }
                         }
                     }
                 });
-
-                reloadCurrentPageOrders();
             },
             error: function (xhr) {
-                let message = 'No se pudo consultar la Nota de Crédito.';
+                const response = xhr.responseJSON || {};
 
-                if (xhr.responseJSON && xhr.responseJSON.message) {
-                    message = xhr.responseJSON.message;
+                let content = escapeHtml(
+                    response.message ||
+                    'No se pudo consultar la Nota de Crédito.'
+                );
+
+                if (response.sunat_responsecode) {
+                    content = `
+            <div class="mb-2">
+                <strong>Código SUNAT:</strong>
+
+                <span class="badge badge-danger">
+                    ${escapeHtml(
+                        String(response.sunat_responsecode)
+                    )}
+                </span>
+            </div>
+
+            <div>
+                ${content}
+            </div>
+        `;
                 }
 
+                const isRejected =
+                    response.credit_note_status === 'rejected';
+
                 $.alert({
-                    title: 'Aviso',
-                    content: message,
-                    type: 'orange',
+                    title: isRejected
+                        ? 'Nota de Crédito rechazada'
+                        : 'Aviso',
+
+                    content: content,
+
+                    type: isRejected
+                        ? 'red'
+                        : 'orange',
+
                     buttons: {
                         ok: {
                             text: 'Entendido',
-                            btnClass: 'btn-warning'
+
+                            btnClass: isRejected
+                                ? 'btn-danger'
+                                : 'btn-warning',
+
+                            action: function () {
+                                reloadCurrentPageOrders();
+                            }
                         }
                     }
                 });
-
-                reloadCurrentPageOrders();
             },
             complete: function () {
                 hideProcessLoader();
@@ -1551,6 +1652,75 @@ $(document).ready(function () {
             });
         }
     );
+
+    $(document).on(
+        'click',
+        '[data-ver_error_nota_credito]',
+        function () {
+            const creditNoteId =
+                $(this).data('credit_note_id');
+
+            const responseCode =
+                String(
+                    $(this).data('response_code') || ''
+                );
+
+            const message =
+                String(
+                    $(this).data('message') ||
+                    'SUNAT rechazó la Nota de Crédito.'
+                );
+
+            let content = `
+            <div class="alert alert-danger mb-3">
+                La Nota de Crédito fue rechazada por SUNAT.
+            </div>
+        `;
+
+            if (responseCode !== '') {
+                content += `
+                <div class="mb-2">
+                    <strong>Código SUNAT:</strong>
+                    <span class="badge badge-danger">
+                        ${escapeHtml(responseCode)}
+                    </span>
+                </div>
+            `;
+            }
+
+            if (creditNoteId) {
+                content += `
+                <div class="mb-2">
+                    <strong>Nota de Crédito interna:</strong>
+                    #${escapeHtml(String(creditNoteId))}
+                </div>
+            `;
+            }
+
+            content += `
+            <div>
+                <strong>Detalle:</strong>
+
+                <div class="border rounded p-2 mt-1 bg-light">
+                    ${escapeHtml(message)}
+                </div>
+            </div>
+        `;
+
+            $.alert({
+                title: 'Nota de Crédito rechazada',
+                content: content,
+                type: 'red',
+                columnClass: 'medium',
+                buttons: {
+                    ok: {
+                        text: 'Entendido',
+                        btnClass: 'btn-danger'
+                    }
+                }
+            });
+        }
+    );
 });
 
 var $formDelete;
@@ -1620,43 +1790,77 @@ function validarDatosGenerarComprobante(
     return true;
 }
 
-function mostrarExitoGeneracionComprobante(
-    response
-) {
+function mostrarExitoGeneracionComprobante(response) {
+    let content = `
+        <p class="mb-2">
+            ${escapeHtml(
+        response.message ||
+        'Comprobante generado correctamente.'
+    )}
+        </p>
+    `;
+
+    if (
+        Array.isArray(response.file_warnings) &&
+        response.file_warnings.length > 0
+    ) {
+        const warnings = response.file_warnings
+            .map(function (warning) {
+                return `
+                    <li>
+                        ${escapeHtml(warning)}
+                    </li>
+                `;
+            })
+            .join('');
+
+        content += `
+            <div class="alert alert-warning mb-0">
+                <strong>Advertencias de archivos:</strong>
+
+                <ul class="mb-0 pl-3">
+                    ${warnings}
+                </ul>
+            </div>
+        `;
+    }
+
+    const buttons = {};
+
+    if (
+        response.pdf_available &&
+        response.url_print
+    ) {
+        buttons.ver = {
+            text: 'Ver PDF',
+            btnClass: 'btn-primary',
+
+            action: function () {
+                finalizarGeneracionComprobante(
+                    response,
+                    true
+                );
+            }
+        };
+    }
+
+    buttons.cerrar = {
+        text: 'Cerrar',
+        btnClass: 'btn-secondary',
+
+        action: function () {
+            finalizarGeneracionComprobante(
+                response,
+                false
+            );
+        }
+    };
+
     $.alert({
         title: 'Comprobante generado',
-
-        content:
-            response.message ||
-            'Comprobante generado correctamente.',
-
+        content: content,
         type: 'green',
-
-        buttons: {
-            ver: {
-                text: 'Ver PDF',
-                btnClass: 'btn-primary',
-
-                action: function () {
-                    finalizarGeneracionComprobante(
-                        response,
-                        true
-                    );
-                }
-            },
-
-            cerrar: {
-                text: 'Cerrar',
-                btnClass: 'btn-secondary',
-
-                action: function () {
-                    finalizarGeneracionComprobante(
-                        response,
-                        false
-                    );
-                }
-            }
-        }
+        buttons: buttons
     });
 }
 
@@ -1918,7 +2122,7 @@ function prepararEnvioNotaCreditoParcial() {
                         contentType: 'application/json',
                         processData: false,
                         success: function (data) {
-                            hideProcessLoader();
+                            //hideProcessLoader();
 
                             $('#modalNotaCreditoParcial').modal('hide');
                             $('#modalNcPartialItems').modal('hide');
@@ -1957,6 +2161,9 @@ function prepararEnvioNotaCreditoParcial() {
                                 type: 'orange'
                             });
                         },
+                        complete: function (xhr) {
+                            hideProcessLoader();
+                        }
                     });
                 }
             },
@@ -3129,6 +3336,38 @@ function renderDataTable(data) {
         `<span class="badge ${badgeClass}">${estadoComprobante}</span>`;*/
     let htmlEstado = `<span class="badge ${badgeClass}">${estadoComprobante}</span>`;
 
+    if (data.has_rejected_credit_note) {
+        const responseCode =
+            data.rejected_credit_note_responsecode || '';
+
+        const rejectionMessage =
+            data.rejected_credit_note_message ||
+            'SUNAT rechazó la Nota de Crédito.';
+
+        htmlEstado += `
+        <br>
+
+        <button
+            type="button"
+            class="btn btn-link btn-sm p-0 mt-1 text-danger"
+            data-ver_error_nota_credito
+            data-credit_note_id="${escapeHtml(
+            String(data.rejected_credit_note_id || '')
+        )}"
+            data-response_code="${escapeHtml(
+            String(responseCode)
+        )}"
+            data-message="${escapeHtml(
+            String(rejectionMessage)
+        )}"
+            title="Ver motivo del rechazo"
+        >
+            <i class="fas fa-exclamation-circle mr-1"></i>
+            Ver rechazo SUNAT
+        </button>
+    `;
+    }
+
     if (data.sunat_error_is_discarded) {
         const reason = data.sunat_error_discard_reason || 'Sin motivo registrado';
 
@@ -3146,8 +3385,6 @@ function renderDataTable(data) {
         </button>
     `;
     }
-
-
 
     if (data.credit_note_status === 'partial') {
         htmlEstado += `<br><span class="badge badge-warning mt-1">NC PARCIAL</span>`;
@@ -3470,6 +3707,7 @@ function renderDataTable(data) {
     const btnNotaCreditoParcial = cloneBtnActive.querySelector("[data-generar_nota_credito_parcial]");
 
     const puedeGenerarNotaParcial =
+        !data.free_sale &&
         (data.type_document === '01' || data.type_document === '03') &&
         data.sunat_status !== 'Error' &&
         parseInt(data.is_annulled) !== 1 &&
