@@ -20,7 +20,7 @@ class User extends Authenticatable
      * @var array
      */
     protected $fillable = [
-        'name', 'email', 'password', 'image', 'enable', 'owner'
+        'name', 'email', 'password', 'image', 'enable', 'owner', 'tenant_id', 'is_platform_admin',
     ];
 
     /**
@@ -39,6 +39,7 @@ class User extends Authenticatable
      */
     protected $casts = [
         'email_verified_at' => 'datetime',
+        'is_platform_admin' => 'boolean',
     ];
 
     public function worker()
@@ -47,4 +48,40 @@ class User extends Authenticatable
     }
 
     //protected $dates = ['deleted_at'];
+    public function tenant()
+    {
+        return $this->belongsTo(Tenant::class);
+    }
+
+    public function companies()
+    {
+        return $this->belongsToMany(
+            Company::class,
+            'company_user'
+        )
+            ->withPivot([
+                'is_default',
+                'is_active',
+            ])
+            ->withTimestamps();
+    }
+
+    public function branches()
+    {
+        return $this->belongsToMany(
+            Branch::class,
+            'branch_user'
+        )
+            ->withPivot([
+                'is_default',
+                'is_active',
+            ])
+            ->withTimestamps();
+    }
+
+    public function isPlatformAdmin()
+    {
+        return (bool) $this->is_platform_admin;
+    }
+
 }
