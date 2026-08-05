@@ -5113,7 +5113,7 @@ class QuoteSaleController extends Controller
         }
     }
 
-    public function updateEquipmentOfQuote(Request $request, $id_equipment, $id_quote)
+    public function updateEquipmentOfQuote1(Request $request, $id_equipment, $id_quote)
     {
         $begin = microtime(true);
 
@@ -5542,6 +5542,1125 @@ class QuoteSaleController extends Controller
                 'line' => $e->getLine(),
             ], 422);
         }
+    }
+
+    public function updateEquipmentOfQuote(
+        Request $request,
+        $id_equipment,
+        $id_quote
+    ) {
+        $begin = microtime(true);
+
+        DB::beginTransaction();
+
+        try {
+            @bcscale(10);
+
+            $quote = Quote::findOrFail($id_quote);
+
+            $equipmentQuote = Equipment::where(
+                'id',
+                $id_equipment
+            )
+                ->where('quote_id', $quote->id)
+                ->firstOrFail();
+
+            $equipments = $request->input('equipment');
+
+            if (
+                !is_array($equipments) ||
+                count($equipments) === 0
+            ) {
+                throw new \Exception(
+                    'No se recibieron equipos.'
+                );
+            }
+
+            $equip = $equipments[0];
+
+            if (!is_array($equip)) {
+                throw new \Exception(
+                    'El equipo recibido tiene un formato inválido.'
+                );
+            }
+
+            /*
+             * La validación monetaria ocurre antes de actualizar, eliminar
+             * detalles o liberar reservas.
+             */
+            $calculated = $this
+                ->calculateAndValidateQuoteEquipmentTotals(
+                    $equip,
+                    $request
+                );
+
+            $equip['consumables'] =
+                $calculated['consumables'];
+
+            $equip['workforces'] =
+                $calculated['workforces'];
+
+            $equip['total'] =
+                $calculated['total_with_igv'];
+
+            /** @var QuoteStockReservationService $reservationService */
+            $reservationService = app(
+                QuoteStockReservationService::class
+            );
+
+            $dateQuote = $request->get('date_quote')
+                ? Carbon::createFromFormat(
+                    'd/m/Y',
+                    $request->get('date_quote')
+                )
+                : null;
+
+            $dateValidate = $request->get('date_validate')
+                ? Carbon::createFromFormat(
+                    'd/m/Y',
+                    $request->get('date_validate')
+                )
+                : null;
+
+            $quote->description_quote =
+                $request->get('descriptionQuote');
+
+            $quote->code =
+                $request->get('codeQuote');
+
+            $quote->date_quote =
+                $dateQuote;
+
+            $quote->date_validate =
+                $dateValidate;
+
+            $quote->way_to_pay =
+                $request->get('way_to_pay') ?? '';
+
+            $quote->delivery_time =
+                $request->get('delivery_time') ?? '';
+
+            $quote->customer_id =
+                $request->get('customer_id') ?: null;
+
+            $quote->contact_id =
+                $request->get('contact_id') ?: null;
+
+            $quote->payment_deadline_id =
+                $request->get('payment_deadline') ?: null;
+
+            $quote->observations =
+                $request->get('observations') ?? '';
+
+            $quote->descuento =
+                $calculated['discount_base'];
+
+            $quote->gravada =
+                $calculated['taxable_base'];
+
+            $quote->igv_total =
+                $calculated['igv'];
+
+            $quote->total_importe =
+                $calculated['total_with_igv'];
+
+            $quote->discount_type =
+                $calculated['discount_type'];
+
+            $quote->discount_input_mode =
+                $calculated['discount_input_mode'];
+
+            $quote->discount_input_value =
+                $calculated['discount_input_value'];
+
+            $quote->save();
+
+            foreach ($equipmentQuote->consumables as $consumable) {
+                $reservationService
+                    ->releaseReservationsByQuoteDetail(
+                        (int) $quote->id,
+                        (int) $consumable->id
+                    );
+
+                $consumable->delete();
+            }
+
+            foreach ($equipmentQuote->workforces as $workforce) {
+                $workforce->delete();
+            }
+
+            foreach ($equipmentQuote->materials as $material) {
+                $material->delete();
+            }
+
+            foreach ($equipmentQuote->electrics as $electric) {
+                $electric->delete();
+            }
+
+            foreach ($equipmentQuote->turnstiles as $turnstile) {
+                $turnstile->delete();
+            }
+
+            foreach ($equipmentQuote->workdays as $workday) {
+                $workday->delete();
+            }
+
+            $equipmentQuote->description =
+                $equip['description'] ?? '';
+
+            $equipmentQuote->detail =
+                $equip['detail'] ?? '';
+
+            $equipmentQuote->quantity =
+                $equip['quantity'] ?? 1;
+
+            $equipmentQuote->utility =
+                $equip['utility'] ?? 0;
+
+            $equipmentQuote->rent =
+                $equip['rent'] ?? 0;
+
+            $equipmentQuote->letter =
+                $equip['letter'] ?? 0;
+
+            $equipmentQuote->total =
+                $calculated['total_with_igv'];
+
+            $equipmentQuote->save();
+
+            $consumables = $equip['consumables'] ?? [];
+
+            foreach ($consumables as $index => $c) {
+                $position = $index + 1;
+
+                $stockItemId = (int) (
+                    $c['stock_item_id']
+                    ?? $c['stockItemId']
+                    ?? $c['id']
+                    ?? 0
+                );
+
+                if ($stockItemId <= 0) {
+                    throw new \Exception(
+                        "No se pudo identificar el stock item del producto {$position}."
+                    );
+                }
+
+                $stockItem = StockItem::with(['material'])
+                    ->where('id', $stockItemId)
+                    ->first();
+
+                if (!$stockItem) {
+                    throw new \Exception(
+                        "El stock item con ID {$stockItemId} no existe."
+                    );
+                }
+
+                if (!$stockItem->material) {
+                    throw new \Exception(
+                        "El stock item con ID {$stockItemId} no tiene material asociado."
+                    );
+                }
+
+                $material = $stockItem->material;
+                $materialId = (int) $material->id;
+
+                $isItemeable =
+                    (int) ($material->tipo_venta_id ?? 0) === 3;
+
+                $presentationId =
+                    $c['presentation_id'] ?? null;
+
+                $packs = null;
+                $unitsPerPack = null;
+                $requestedUnits = '0.0000000000';
+
+                if (!empty($presentationId)) {
+                    $packsDecimal = $this->normalizeQuoteDecimal(
+                        $c['quantity'] ?? 0,
+                        "packs de {$stockItem->display_name}"
+                    );
+
+                    if (
+                        bccomp(
+                            $packsDecimal,
+                            '1.0000000000',
+                            10
+                        ) < 0
+                    ) {
+                        throw new \Exception(
+                            "Packs inválidos para {$stockItem->display_name}."
+                        );
+                    }
+
+                    if (
+                        bccomp(
+                            $packsDecimal,
+                            number_format(
+                                floor((float) $packsDecimal),
+                                10,
+                                '.',
+                                ''
+                            ),
+                            10
+                        ) !== 0
+                    ) {
+                        throw new \Exception(
+                            "La cantidad de packs debe ser entera para {$stockItem->display_name}."
+                        );
+                    }
+
+                    $packs = (int) $packsDecimal;
+
+                    $presentation = MaterialPresentation::where(
+                        'id',
+                        $presentationId
+                    )
+                        ->where(
+                            'material_id',
+                            $materialId
+                        )
+                        ->where('active', 1)
+                        ->first();
+
+                    if (!$presentation) {
+                        throw new \Exception(
+                            "Presentación inválida para {$stockItem->display_name}."
+                        );
+                    }
+
+                    $unitsPerPack =
+                        (int) $presentation->quantity;
+
+                    if ($unitsPerPack < 1) {
+                        throw new \Exception(
+                            "Units per pack inválido para {$stockItem->display_name}."
+                        );
+                    }
+
+                    $requestedUnits = bcmul(
+                        (string) $packs,
+                        (string) $unitsPerPack,
+                        10
+                    );
+                } else {
+                    $requestedUnits = $this->normalizeQuoteDecimal(
+                        $c['units_equivalent']
+                        ?? $c['quantity']
+                        ?? 0,
+                        "cantidad de {$stockItem->display_name}"
+                    );
+
+                    if (
+                        bccomp(
+                            $requestedUnits,
+                            '0.0000000000',
+                            10
+                        ) <= 0
+                    ) {
+                        throw new \Exception(
+                            "Cantidad inválida para {$stockItem->display_name}."
+                        );
+                    }
+                }
+
+                $priceReal = $this->normalizeQuoteDecimal(
+                    $c['priceReal']
+                    ?? $c['price']
+                    ?? 0,
+                    "precio de {$stockItem->display_name}"
+                );
+
+                $valorUnitarioReal = bcdiv(
+                    $priceReal,
+                    '1.1800000000',
+                    10
+                );
+
+                $quantityForPrice = !empty($presentationId)
+                    ? number_format(
+                        (float) $packs,
+                        10,
+                        '.',
+                        ''
+                    )
+                    : $requestedUnits;
+
+                $importeReal = bcmul(
+                    $quantityForPrice,
+                    $priceReal,
+                    10
+                );
+
+                $selectedItemIds = [];
+
+                if ($isItemeable) {
+                    $rawSelectedItemIds =
+                        $c['selected_item_ids'] ?? [];
+
+                    if (is_string($rawSelectedItemIds)) {
+                        $decodedIds = json_decode(
+                            $rawSelectedItemIds,
+                            true
+                        );
+
+                        $rawSelectedItemIds =
+                            is_array($decodedIds)
+                                ? $decodedIds
+                                : [];
+                    }
+
+                    if (!is_array($rawSelectedItemIds)) {
+                        $rawSelectedItemIds = [];
+                    }
+
+                    $selectedItemIds = collect(
+                        $rawSelectedItemIds
+                    )
+                        ->map(function ($itemId) {
+                            return (int) $itemId;
+                        })
+                        ->filter(function ($itemId) {
+                            return $itemId > 0;
+                        })
+                        ->values()
+                        ->toArray();
+
+                    if (empty($selectedItemIds)) {
+                        throw new \Exception(
+                            "Debe seleccionar los ítems físicos para {$material->full_name}."
+                        );
+                    }
+
+                    if (
+                        count($selectedItemIds) !==
+                        count(array_unique($selectedItemIds))
+                    ) {
+                        throw new \Exception(
+                            "Se detectaron ítems repetidos para {$material->full_name}."
+                        );
+                    }
+
+                    if (
+                        (int) $requestedUnits !==
+                        count($selectedItemIds)
+                    ) {
+                        throw new \Exception(
+                            "La cantidad de ítems seleccionados no coincide con la cantidad requerida para {$material->full_name}. " .
+                            "Requerido: {$requestedUnits}. " .
+                            'Seleccionados: ' .
+                            count($selectedItemIds) .
+                            '.'
+                        );
+                    }
+                }
+
+                $available = $reservationService
+                    ->getAvailableStockByStockItem(
+                        $stockItemId
+                    );
+
+                if (
+                    (float) $requestedUnits >
+                    (float) $available
+                ) {
+                    throw new \Exception(
+                        "Stock insuficiente para {$material->full_name}. " .
+                        "Requerido: {$requestedUnits}. " .
+                        "Disponible: {$available}."
+                    );
+                }
+
+                $equipmentConsumable =
+                    EquipmentConsumable::create([
+                        'equipment_id' =>
+                            $equipmentQuote->id,
+
+                        'material_id' =>
+                            $materialId,
+
+                        'stock_item_id' =>
+                            $stockItemId,
+
+                        'material_presentation_id' =>
+                            $presentationId,
+
+                        'packs' =>
+                            $packs,
+
+                        'units_per_pack' =>
+                            $unitsPerPack,
+
+                        'quantity' =>
+                            (float) $requestedUnits,
+
+                        'price' =>
+                            $priceReal,
+
+                        'valor_unitario' =>
+                            $valorUnitarioReal,
+
+                        'total' =>
+                            $importeReal,
+
+                        'discount' =>
+                            '0.0000000000',
+
+                        'type_promo' =>
+                            null,
+
+                        'availability' =>
+                            'Completo',
+
+                        'state' =>
+                            'En compra',
+                    ]);
+
+                if ($isItemeable) {
+                    $reservationService
+                        ->reserveItemeableForQuoteDetail(
+                            (int) $quote->id,
+                            (int) $equipmentConsumable->id,
+                            (int) $stockItemId,
+                            $selectedItemIds
+                        );
+                } else {
+                    $reservationService
+                        ->reserveForQuoteDetail(
+                            (int) $quote->id,
+                            (int) $equipmentConsumable->id,
+                            (int) $stockItemId,
+                            (float) $requestedUnits
+                        );
+                }
+            }
+
+            $workforces = $equip['workforces'] ?? [];
+
+            foreach ($workforces as $index => $workforce) {
+                $position = $index + 1;
+
+                $price = $this->normalizeQuoteDecimal(
+                    $workforce['price'] ?? 0,
+                    "precio del servicio {$position}"
+                );
+
+                $quantity = $this->normalizeQuoteDecimal(
+                    $workforce['quantity'] ?? 0,
+                    "cantidad del servicio {$position}"
+                );
+
+                $total = bcmul(
+                    $price,
+                    $quantity,
+                    10
+                );
+
+                $billable = isset($workforce['billable'])
+                    ? (int) $workforce['billable']
+                    : 1;
+
+                $billable = $billable === 1 ? 1 : 0;
+
+                EquipmentWorkforce::create([
+                    'equipment_id' =>
+                        $equipmentQuote->id,
+
+                    'description' =>
+                        $workforce['description'] ?? '',
+
+                    'price' =>
+                        $price,
+
+                    'quantity' =>
+                        (float) $quantity,
+
+                    'total' =>
+                        $total,
+
+                    'unit' =>
+                        $workforce['unit'] ?? '',
+
+                    'billable' =>
+                        $billable,
+                ]);
+            }
+
+            Audit::create([
+                'user_id' => Auth::user()->id,
+                'action' =>
+                    'Modificar equipo de cotizacion (EDIT)',
+                'time' =>
+                    microtime(true) - $begin,
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'message' =>
+                    'Equipo guardado con éxito.',
+
+                'equipment' =>
+                    $equipmentQuote->fresh(),
+
+                'quote' =>
+                    $quote->fresh(),
+
+                'calculated_totals' => [
+                    'subtotal_consumables' =>
+                        (float) $calculated[
+                        'subtotal_consumables'
+                        ],
+
+                    'subtotal_workforces' =>
+                        (float) $calculated[
+                        'subtotal_workforces'
+                        ],
+
+                    'subtotal_with_igv' =>
+                        (float) $calculated[
+                        'subtotal_with_igv'
+                        ],
+
+                    'discount_base' =>
+                        (float) $calculated[
+                        'discount_base'
+                        ],
+
+                    'discount_with_igv' =>
+                        (float) $calculated[
+                        'discount_with_igv'
+                        ],
+
+                    'gravada' =>
+                        (float) $calculated[
+                        'taxable_base'
+                        ],
+
+                    'igv' =>
+                        (float) $calculated[
+                        'igv'
+                        ],
+
+                    'total' =>
+                        (float) $calculated[
+                        'total_with_igv'
+                        ],
+                ],
+            ], 200);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+
+            return response()->json([
+                'message' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ], 422);
+        }
+    }
+
+    /**
+     * Convierte y valida un valor decimal recibido.
+     */
+    private function normalizeQuoteDecimal($value,string $field,bool $allowNegative = false): string {
+        if ($value === null || $value === '') {
+            $value = '0';
+        }
+
+        $value = str_replace(',', '.', trim((string) $value));
+
+        if (!is_numeric($value)) {
+            throw new \Exception(
+                "El campo {$field} contiene un valor numérico inválido."
+            );
+        }
+
+        $normalized = number_format(
+            (float) $value,
+            10,
+            '.',
+            ''
+        );
+
+        if (
+            !$allowNegative &&
+            bccomp($normalized, '0.0000000000', 10) < 0
+        ) {
+            throw new \Exception(
+                "El campo {$field} no puede ser negativo."
+            );
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * Obtiene el valor absoluto de un decimal BCMath.
+     */
+    private function bcAbs(string $value, int $scale = 10): string
+    {
+        return bccomp($value, '0', $scale) < 0
+            ? bcmul($value, '-1', $scale)
+            : $value;
+    }
+
+    /**
+     * Valida que dos importes sean iguales dentro de una tolerancia.
+     */
+    private function assertAmountsMatch(string $expected,string $received,string $message,string $tolerance = '0.0100000000'): void {
+        $difference = bcsub($expected, $received, 10);
+        $difference = $this->bcAbs($difference, 10);
+
+        if (bccomp($difference, $tolerance, 10) > 0) {
+            throw new \Exception(
+                $message .
+                ' Esperado: S/ ' . number_format((float) $expected, 2) .
+                '. Recibido: S/ ' . number_format((float) $received, 2) . '.'
+            );
+        }
+    }
+
+    /**
+     * Recalcula y valida todos los importes del equipo.
+     *
+     * No confía en los totales enviados por JavaScript.calculateAndValidateQuoteEquipmentTotals
+     */
+    private function calculateAndValidateQuoteEquipmentTotals(array $equip,Request $request): array {
+        @bcscale(10);
+
+        $subtotalConsumables = '0.0000000000';
+        $subtotalWorkforces = '0.0000000000';
+
+        $normalizedConsumables = [];
+        $normalizedWorkforces = [];
+
+        /*
+        |--------------------------------------------------------------------------
+        | 1. CONSUMIBLES
+        |--------------------------------------------------------------------------
+        */
+        $consumables = $equip['consumables'] ?? [];
+
+        if (!is_array($consumables)) {
+            throw new \Exception(
+                'El detalle de consumibles tiene un formato inválido.'
+            );
+        }
+
+        foreach ($consumables as $index => $consumable) {
+            $position = $index + 1;
+
+            $presentationId =
+                $consumable['presentation_id'] ?? null;
+
+            /*
+             * Cuando existe presentación, quantity representa packs.
+             * Cuando no existe presentación, representa unidades.
+             */
+            $quantityForPrice = $this->normalizeQuoteDecimal(
+                $consumable['quantity'] ?? 0,
+                "cantidad del producto {$position}"
+            );
+
+            if (
+                bccomp(
+                    $quantityForPrice,
+                    '0.0000000000',
+                    10
+                ) <= 0
+            ) {
+                throw new \Exception(
+                    "La cantidad del producto {$position} debe ser mayor que cero."
+                );
+            }
+
+            $price = $this->normalizeQuoteDecimal(
+                $consumable['priceReal']
+                ?? $consumable['price']
+                ?? 0,
+                "precio del producto {$position}"
+            );
+
+            /*
+             * Total calculado por el backend.
+             */
+            $calculatedTotal = bcmul(
+                $quantityForPrice,
+                $price,
+                10
+            );
+
+            /*
+             * Como el descuento es global, no debe aplicarse un
+             * descuento independiente dentro de cada producto.
+             */
+            $lineDiscount = $this->normalizeQuoteDecimal(
+                $consumable['discount'] ?? 0,
+                "descuento del producto {$position}"
+            );
+
+            if (
+                bccomp(
+                    $lineDiscount,
+                    '0.0000000000',
+                    10
+                ) !== 0
+            ) {
+                throw new \Exception(
+                    "El producto {$position} contiene un descuento por ítem. " .
+                    'Los descuentos deben aplicarse únicamente de forma global.'
+                );
+            }
+
+            /*
+             * Validar el importe que envió JavaScript.
+             */
+            $receivedTotal = $this->normalizeQuoteDecimal(
+                $consumable['importe'] ?? 0,
+                "importe del producto {$position}"
+            );
+
+            $this->assertAmountsMatch(
+                $calculatedTotal,
+                $receivedTotal,
+                "El importe del producto {$position} no coincide con cantidad por precio."
+            );
+
+            $subtotalConsumables = bcadd(
+                $subtotalConsumables,
+                $calculatedTotal,
+                10
+            );
+
+            /*
+             * Se conserva la información original, pero el importe
+             * queda reemplazado por el cálculo confiable del backend.
+             */
+            $consumable['importe'] = $calculatedTotal;
+            $consumable['priceReal'] = $price;
+            $consumable['discount'] = '0.0000000000';
+
+            $normalizedConsumables[] = $consumable;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2. SERVICIOS ADICIONALES
+        |--------------------------------------------------------------------------
+        */
+        $workforces = $equip['workforces'] ?? [];
+
+        if (!is_array($workforces)) {
+            throw new \Exception(
+                'El detalle de servicios tiene un formato inválido.'
+            );
+        }
+
+        foreach ($workforces as $index => $workforce) {
+            $position = $index + 1;
+
+            $quantity = $this->normalizeQuoteDecimal(
+                $workforce['quantity'] ?? 0,
+                "cantidad del servicio {$position}"
+            );
+
+            if (
+                bccomp(
+                    $quantity,
+                    '0.0000000000',
+                    10
+                ) <= 0
+            ) {
+                throw new \Exception(
+                    "La cantidad del servicio {$position} debe ser mayor que cero."
+                );
+            }
+
+            $price = $this->normalizeQuoteDecimal(
+                $workforce['price'] ?? 0,
+                "precio del servicio {$position}"
+            );
+
+            $calculatedTotal = bcmul(
+                $quantity,
+                $price,
+                10
+            );
+
+            $receivedTotal = $this->normalizeQuoteDecimal(
+                $workforce['importe'] ?? 0,
+                "importe del servicio {$position}"
+            );
+
+            $this->assertAmountsMatch(
+                $calculatedTotal,
+                $receivedTotal,
+                "El importe del servicio {$position} no coincide con cantidad por precio."
+            );
+
+            $billable = isset($workforce['billable'])
+                ? (int) $workforce['billable']
+                : 1;
+
+            /*
+             * Solo los servicios facturables forman parte del total.
+             */
+            if ($billable === 1) {
+                $subtotalWorkforces = bcadd(
+                    $subtotalWorkforces,
+                    $calculatedTotal,
+                    10
+                );
+            }
+
+            $workforce['price'] = $price;
+            $workforce['importe'] = $calculatedTotal;
+            $workforce['billable'] = $billable;
+
+            $normalizedWorkforces[] = $workforce;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 3. SUBTOTAL CON IGV ANTES DEL DESCUENTO
+        |--------------------------------------------------------------------------
+        */
+        $subtotalWithIgv = bcadd(
+            $subtotalConsumables,
+            $subtotalWorkforces,
+            10
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4. CONFIGURACIÓN DEL DESCUENTO GLOBAL
+        |--------------------------------------------------------------------------
+        */
+        $igvPercentage = '18.0000000000';
+        $factor = '1.1800000000';
+
+        $discountType = strtolower(
+            trim((string) $request->input(
+                'discount_type',
+                'amount'
+            ))
+        );
+
+        $discountInputMode = strtolower(
+            trim((string) $request->input(
+                'discount_input_mode',
+                'without_igv'
+            ))
+        );
+
+        $discountInputValue = $this->normalizeQuoteDecimal(
+            $request->input('discount_input_value', 0),
+            'valor del descuento global'
+        );
+
+        if (
+        !in_array(
+            $discountType,
+            ['amount', 'percentage'],
+            true
+        )
+        ) {
+            throw new \Exception(
+                'El tipo de descuento global no es válido.'
+            );
+        }
+
+        if (
+        !in_array(
+            $discountInputMode,
+            ['with_igv', 'without_igv'],
+            true
+        )
+        ) {
+            throw new \Exception(
+                'La modalidad del descuento global no es válida.'
+            );
+        }
+
+        $discountWithIgv = '0.0000000000';
+        $discountBase = '0.0000000000';
+
+        /*
+        |--------------------------------------------------------------------------
+        | 5. CALCULAR DESCUENTO
+        |--------------------------------------------------------------------------
+        */
+        if ($discountType === 'percentage') {
+            if (
+                bccomp(
+                    $discountInputValue,
+                    '100.0000000000',
+                    10
+                ) > 0
+            ) {
+                throw new \Exception(
+                    'El porcentaje de descuento no puede ser mayor a 100%.'
+                );
+            }
+
+            /*
+             * El porcentaje se aplica sobre el subtotal completo.
+             * El modo con/sin IGV no modifica matemáticamente el porcentaje.
+             */
+            $percentageFactor = bcdiv(
+                $discountInputValue,
+                '100.0000000000',
+                10
+            );
+
+            $discountWithIgv = bcmul(
+                $subtotalWithIgv,
+                $percentageFactor,
+                10
+            );
+
+            $discountBase = bcdiv(
+                $discountWithIgv,
+                $factor,
+                10
+            );
+        } else {
+            /*
+             * Descuento por monto exacto.
+             */
+            if ($discountInputMode === 'with_igv') {
+                $discountWithIgv = $discountInputValue;
+
+                $discountBase = bcdiv(
+                    $discountWithIgv,
+                    $factor,
+                    10
+                );
+            } else {
+                $discountBase = $discountInputValue;
+
+                $discountWithIgv = bcmul(
+                    $discountBase,
+                    $factor,
+                    10
+                );
+            }
+        }
+
+        if (
+            bccomp(
+                $discountWithIgv,
+                $subtotalWithIgv,
+                10
+            ) > 0
+        ) {
+            throw new \Exception(
+                'El descuento global no puede ser mayor que el subtotal.'
+            );
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 6. TOTAL FINAL
+        |--------------------------------------------------------------------------
+        */
+        $totalWithIgv = bcsub(
+            $subtotalWithIgv,
+            $discountWithIgv,
+            10
+        );
+
+        $taxableBase = bcdiv(
+            $totalWithIgv,
+            $factor,
+            10
+        );
+
+        $igv = bcsub(
+            $totalWithIgv,
+            $taxableBase,
+            10
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | 7. VALIDAR TOTALES ENVIADOS POR JAVASCRIPT
+        |--------------------------------------------------------------------------
+        */
+        $receivedDiscount = $this->normalizeQuoteDecimal(
+            $request->input('descuento', 0),
+            'descuento enviado'
+        );
+
+        $receivedTaxableBase = $this->normalizeQuoteDecimal(
+            $request->input('gravada', 0),
+            'operación gravada enviada'
+        );
+
+        $receivedIgv = $this->normalizeQuoteDecimal(
+            $request->input('igv_total', 0),
+            'IGV enviado'
+        );
+
+        $receivedTotal = $this->normalizeQuoteDecimal(
+            $request->input('total_importe', 0),
+            'importe total enviado'
+        );
+
+        $equipmentReceivedTotal = $this->normalizeQuoteDecimal(
+            $equip['total'] ?? 0,
+            'total del equipo'
+        );
+
+        $this->assertAmountsMatch(
+            $discountBase,
+            $receivedDiscount,
+            'El descuento global enviado no coincide con el cálculo del servidor.'
+        );
+
+        $this->assertAmountsMatch(
+            $taxableBase,
+            $receivedTaxableBase,
+            'La operación gravada enviada no coincide con el cálculo del servidor.'
+        );
+
+        $this->assertAmountsMatch(
+            $igv,
+            $receivedIgv,
+            'El IGV enviado no coincide con el cálculo del servidor.'
+        );
+
+        $this->assertAmountsMatch(
+            $totalWithIgv,
+            $receivedTotal,
+            'El importe total enviado no coincide con la suma de los detalles.'
+        );
+
+        $this->assertAmountsMatch(
+            $totalWithIgv,
+            $equipmentReceivedTotal,
+            'El total del equipo no coincide con la suma de sus detalles.'
+        );
+
+        return [
+            'consumables' => $normalizedConsumables,
+            'workforces' => $normalizedWorkforces,
+
+            'subtotal_consumables' => $subtotalConsumables,
+            'subtotal_workforces' => $subtotalWorkforces,
+            'subtotal_with_igv' => $subtotalWithIgv,
+
+            'discount_base' => $discountBase,
+            'discount_with_igv' => $discountWithIgv,
+
+            'taxable_base' => $taxableBase,
+            'igv' => $igv,
+            'total_with_igv' => $totalWithIgv,
+
+            'discount_type' => $discountType,
+            'discount_input_mode' => $discountInputMode,
+            'discount_input_value' => $discountInputValue,
+        ];
     }
 
     public function showRegistrarComprobante($typeComprobante)
