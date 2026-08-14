@@ -5107,11 +5107,28 @@ class PuntoVentaController extends Controller
                 ], 422);
             }
 
+            /*
+             * ============================================================
+             * RESPUESTA PENDIENTE / INCONCLUSA
+             * ============================================================
+             *
+             * Puede ser:
+             * - SUNAT todavía no terminó de procesar.
+             * - Nubefact devolvió una respuesta vacía.
+             * - Hubo un error SOAP/técnico.
+             *
+             * En todos estos casos la anulación continúa pendiente
+             * y podrá volver a consultarse manualmente o mediante cron.
+            */
+
             DB::commit();
 
             return response()->json([
-                'message' => 'La anulación todavía está pendiente de aceptación por SUNAT.',
+                'message' => $sale->annulment_sunat_message
+                    ?: 'La anulación todavía está pendiente de aceptación por SUNAT.',
                 'annulment_status' => 'pending',
+                'pending_annulment' => true,
+                'internal_reversal_status' => $sale->internal_reversal_status,
             ], 200);
 
         } catch (\Throwable $e) {
