@@ -10,6 +10,7 @@ use App\Http\Controllers\Traits\NubefactTrait;
 use App\InventoryLevel;
 use App\Item;
 use App\OutputDetail;
+use App\Quote;
 use App\QuoteMaterialReservation;
 use App\QuoteStockLot;
 use App\Sale;
@@ -155,7 +156,7 @@ class CheckPendingSunatDocuments extends Command
         return 0;
     }
 
-    private function processAnnulmentInCommand(Sale $sale): array
+    private function processAnnulmentInCommandO(Sale $sale): array
     {
         DB::beginTransaction();
 
@@ -320,7 +321,7 @@ class CheckPendingSunatDocuments extends Command
         }
     }
 
-    private function reverseSaleInternallyInCommand(Sale $sale, ?string $reason = null, bool $markAsAnnulled = true): void
+    private function reverseSaleInternallyInCommandO(Sale $sale, ?string $reason = null, bool $markAsAnnulled = true): void
     {
         if ($sale->internal_reversal_status === 'reversed') {
             return;
@@ -523,6 +524,473 @@ class CheckPendingSunatDocuments extends Command
         $sale->save();
     }
 
+    private function reverseSaleInternallyInCommand(Sale $sale, ?string $reason = null, bool $markAsAnnulled = true): void
+    {
+        if ($sale->internal_reversal_status === 'reversed') {
+            return;
+        }
+
+        $systemUserId = config('services.nubefact.system_user_id');
+
+        /*
+         * Nos permitirá saber si esta venta contenía
+         * al menos un producto itemeable.
+         */
+        $hasItemizedProducts = false;
+
+        /*
+         * ============================================================
+         * 1) REVERTIR STOCK DESDE OUTPUT DETAILS
+         * ============================================================
+         */
+        $inventoryKeysToSync = [];
+
+        foreach ($sale->details as $detail) {
+
+            $outputDetails = OutputDetail::where(
+                'sale_detail_id',
+                $detail->id
+            )
+                ->lockForUpdate()
+                ->get();
+
+            foreach ($outputDetails as $outputDetail) {
+
+                $qtyToReturn = (float) (
+                    $outputDetail->percentage ?? 0
+                );
+
+                if ($qtyToReturn <= 0) {
+                    $qtyToReturn = (float) (
+                        $detail->quantity ?? 0
+                    );
+                }
+
+                /*
+                 * ========================================================
+                 * DEVOLVER STOCK AL LOTE
+                 * ========================================================
+                 */
+                if (!empty($outputDetail->stock_lot_id)) {
+
+                    $lot = StockLot::where(
+                        'id',
+                        $outputDetail->stock_lot_id
+                    )
+                        ->lockForUpdate()
+                        ->first();
+
+                    if ($lot) {
+
+                        $lot->qty_on_hand =
+                            (float) $lot->qty_on_hand
+                            + $qtyToReturn;
+
+                        $lot->save();
+
+                        $inventoryKeysToSync[] = [
+                            'stock_item_id' => (int) $lot->stock_item_id,
+                            'warehouse_id'  => $lot->warehouse_id,
+                            'location_id'   => $lot->location_id,
+                        ];
+                    }
+                }
+
+                /*
+                 * ========================================================
+                 * PRODUCTO ITEMEABLE
+                 * ========================================================
+                 */
+                if (!empty($outputDetail->item_id)) {
+
+                    /*
+                     * La venta sí contenía productos itemeables.
+                     */
+                    $hasItemizedProducts = true;
+
+                    $item = Item::where(
+                        'id',
+                        $outputDetail->item_id
+                    )
+                        ->lockForUpdate()
+                        ->first();
+
+                    if ($item) {
+                        $item->state_item = 'entered';
+                        $item->save();
+                    }
+                }
+
+                /*
+                 * Ya devolvimos el stock/item.
+                 * Eliminamos el detalle de salida.
+                 */
+                $outputDetail->delete();
+            }
+        }
+
+        /*
+         * ============================================================
+         * 2) SINCRONIZAR INVENTORY LEVELS
+         * ============================================================
+         */
+        $inventoryKeysToSync = collect($inventoryKeysToSync)
+            ->unique(function ($row) {
+
+                return implode('|', [
+                    $row['stock_item_id'] ?? 'null',
+                    $row['warehouse_id'] ?? 'null',
+                    $row['location_id'] ?? 'null',
+                ]);
+            })
+            ->values()
+            ->all();
+
+        foreach ($inventoryKeysToSync as $key) {
+
+            $this->syncInventoryLevelFromLots(
+                (int) $key['stock_item_id'],
+                $key['warehouse_id'],
+                $key['location_id']
+            );
+        }
+
+        /*
+         * ============================================================
+         * 3) REVERTIR MOVIMIENTOS DE CAJA
+         * ============================================================
+         */
+        $movements = CashMovement::where(
+            'sale_id',
+            $sale->id
+        )
+            ->get();
+
+        foreach ($movements as $movement) {
+
+            $cashBoxSubType = $movement->cash_box_subtype_id
+                ? CashBoxSubtype::find(
+                    $movement->cash_box_subtype_id
+                )
+                : null;
+
+            $isDeferred = $cashBoxSubType
+                ? (int) $cashBoxSubType->is_deferred
+                : 0;
+
+            $cashBoxSubtypeIdToUse = $cashBoxSubType
+                ? $cashBoxSubType->id
+                : null;
+
+            /*
+             * ========================================================
+             * MOVIMIENTO TIPO SALE
+             * ========================================================
+             */
+            if ($movement->type === 'sale') {
+
+                /*
+                 * Caja diferida
+                 */
+                if ($isDeferred == 1) {
+
+                    /*
+                     * No regularizado:
+                     * simplemente eliminamos el movimiento.
+                     */
+                    if ((int) $movement->regularize === 0) {
+
+                        $movement->delete();
+
+                        /*
+                         * Regularizado:
+                         * debemos generar el egreso correspondiente.
+                         */
+                    } elseif ((int) $movement->regularize === 1) {
+
+                        $amountToReverse = (float) (
+                            $movement->amount_regularize
+                            ?? $movement->amount
+                            ?? 0
+                        );
+
+                        CashMovement::create([
+                            'cash_register_id' =>
+                                $movement->cash_register_id,
+
+                            'sale_id' =>
+                                $sale->id,
+
+                            'type' =>
+                                'expense',
+
+                            'amount' =>
+                                $amountToReverse,
+
+                            'description' =>
+                                'Reversión automática de venta '
+                                . '(POS regularizado) por anulación '
+                                . 'de venta #'
+                                . $sale->id,
+
+                            'regularize' =>
+                                $movement->regularize,
+
+                            'cash_box_subtype_id' =>
+                                $cashBoxSubtypeIdToUse,
+                        ]);
+
+                        $cashRegister = CashRegister::find(
+                            $movement->cash_register_id
+                        );
+
+                        if ($cashRegister) {
+
+                            $cashRegister->current_balance -=
+                                $amountToReverse;
+
+                            $cashRegister->total_sales -=
+                                $amountToReverse;
+
+                            $cashRegister->total_expenses +=
+                                $amountToReverse;
+
+                            $cashRegister->save();
+                        }
+                    }
+
+                    /*
+                     * Caja normal
+                     */
+                } else {
+
+                    $amountToReverse =
+                        (float) $movement->amount;
+
+                    CashMovement::create([
+                        'cash_register_id' =>
+                            $movement->cash_register_id,
+
+                        'sale_id' =>
+                            $sale->id,
+
+                        'type' =>
+                            'expense',
+
+                        'amount' =>
+                            $amountToReverse,
+
+                        'description' =>
+                            'Reversión automática de venta '
+                            . 'por anulación de venta #'
+                            . $sale->id,
+
+                        'regularize' =>
+                            $movement->regularize,
+
+                        'cash_box_subtype_id' =>
+                            $cashBoxSubtypeIdToUse,
+                    ]);
+
+                    $cashRegister = CashRegister::find(
+                        $movement->cash_register_id
+                    );
+
+                    if ($cashRegister) {
+
+                        $cashRegister->current_balance -=
+                            $amountToReverse;
+
+                        $cashRegister->total_sales -=
+                            $amountToReverse;
+
+                        $cashRegister->total_expenses +=
+                            $amountToReverse;
+
+                        $cashRegister->save();
+                    }
+                }
+
+                /*
+                 * ========================================================
+                 * MOVIMIENTO TIPO EXPENSE
+                 * ========================================================
+                 */
+            } elseif ($movement->type === 'expense') {
+
+                $amountToReverse =
+                    (float) $movement->amount;
+
+                CashMovement::create([
+                    'cash_register_id' =>
+                        $movement->cash_register_id,
+
+                    'sale_id' =>
+                        $sale->id,
+
+                    'type' =>
+                        'income',
+
+                    'amount' =>
+                        $amountToReverse,
+
+                    'description' =>
+                        'Reversión automática de gasto (vuelto) '
+                        . 'por anulación de orden #'
+                        . $sale->id,
+
+                    'subtype' =>
+                        $movement->subtype,
+
+                    'regularize' =>
+                        $movement->regularize,
+
+                    'cash_box_subtype_id' =>
+                        $cashBoxSubtypeIdToUse,
+                ]);
+
+                $cashRegister = CashRegister::find(
+                    $movement->cash_register_id
+                );
+
+                if ($cashRegister) {
+
+                    $cashRegister->current_balance +=
+                        $amountToReverse;
+
+                    $cashRegister->total_incomes +=
+                        $amountToReverse;
+
+                    $cashRegister->total_expenses -=
+                        $amountToReverse;
+
+                    $cashRegister->save();
+                }
+            }
+        }
+
+        /*
+         * ============================================================
+         * 4) CANCELAR COTIZACIÓN SI TENÍA PRODUCTOS ITEMEABLES
+         * ============================================================
+         *
+         * QuoteStockLot era una reserva temporal y ya fue consumida
+         * al generar la venta.
+         *
+         * Si posteriormente anulamos esa venta y había items,
+         * por ahora hemos decidido cancelar la cotización para evitar
+         * que vuelva a facturarse sin poder reconstruir correctamente
+         * los items originales.
+         */
+        if (
+            $hasItemizedProducts &&
+            !empty($sale->quote_id)
+        ) {
+
+            $quote = Quote::where(
+                'id',
+                $sale->quote_id
+            )
+                ->lockForUpdate()
+                ->first();
+
+            if (
+                $quote &&
+                $quote->state !== 'canceled'
+            ) {
+                $quote->state = 'canceled';
+                $quote->save();
+            }
+        }
+
+        /*
+         * ============================================================
+         * 5) LIMPIAR RESERVAS LEGACY
+         * ============================================================
+         */
+        if (!empty($sale->quote_id)) {
+
+            QuoteMaterialReservation::where(
+                'quote_id',
+                $sale->quote_id
+            )
+                ->lockForUpdate()
+                ->delete();
+
+            QuoteStockLot::where(
+                'quote_id',
+                $sale->quote_id
+            )
+                ->lockForUpdate()
+                ->delete();
+        }
+
+        /*
+         * ============================================================
+         * 6) ANULAR PAGOS PARCIALES
+         * ============================================================
+         */
+        $partialPayments = SalePartialPayment::where(
+            'sale_id',
+            $sale->id
+        )
+            ->get();
+
+        foreach ($partialPayments as $partialPayment) {
+
+            $partialPayment->state = 0;
+            $partialPayment->save();
+        }
+
+        /*
+         * ============================================================
+         * 7) MARCAR REVERSIÓN OPERATIVA
+         * ============================================================
+         */
+        if ($markAsAnnulled) {
+            $sale->state_annulled = 1;
+        }
+
+        $sale->internal_reversal_status = 'reversed';
+        $sale->internal_reversed_at = now();
+        $sale->internal_reversed_by = $systemUserId;
+
+        if (
+            empty($sale->annulment_status) ||
+            $sale->annulment_status === 'none'
+        ) {
+
+            $sale->annulment_status =
+                $markAsAnnulled
+                    ? 'accepted'
+                    : 'pending';
+        }
+
+        $sale->annulment_reason = $reason;
+
+        if (empty($sale->annulment_requested_at)) {
+            $sale->annulment_requested_at = now();
+        }
+
+        if (empty($sale->annulment_requested_by)) {
+            $sale->annulment_requested_by =
+                $systemUserId;
+        }
+
+        if ($markAsAnnulled) {
+
+            $sale->annulment_accepted_at =
+                $sale->annulment_accepted_at
+                    ?: now();
+
+            $sale->annulled_by =
+                $sale->annulled_by
+                    ?: $systemUserId;
+        }
+
+        $sale->save();
+    }
+
     private function processCreditNoteInCommand(CreditNote $creditNote): array
     {
         DB::beginTransaction();
@@ -646,6 +1114,354 @@ class CheckPendingSunatDocuments extends Command
         }
     }
 
+    private function processAnnulmentInCommand(Sale $sale): array
+    {
+        DB::beginTransaction();
+
+        try {
+            $systemUserId = config('services.nubefact.system_user_id');
+
+            $sale = Sale::with(['details'])
+                ->lockForUpdate()
+                ->find($sale->id);
+
+            if (!$sale) {
+                DB::rollBack();
+
+                return [
+                    'status' => 'error',
+                    'message' => 'Venta no encontrada.',
+                ];
+            }
+
+            /*
+             * ============================================================
+             * VENTA YA ANULADA DEFINITIVAMENTE
+             * ============================================================
+             */
+            if ((int) $sale->state_annulled === 1) {
+                DB::commit();
+
+                return [
+                    'status' => 'accepted',
+                    'message' => 'La venta ya se encuentra anulada internamente.',
+                ];
+            }
+
+            /*
+             * ============================================================
+             * VALIDAR QUE TENGA UNA ANULACIÓN PENDIENTE
+             * ============================================================
+             */
+            if (!in_array(
+                $sale->annulment_status,
+                [
+                    'pending',
+                    'waiting_sunat_process',
+                ],
+                true
+            )) {
+                DB::commit();
+
+                return [
+                    'status' => 'skipped',
+                    'message' => 'La venta no tiene anulación pendiente.',
+                ];
+            }
+
+            /*
+             * ============================================================
+             * BOLETA EN WAITING_SUNAT_PROCESS
+             * ============================================================
+             */
+            if ($sale->annulment_status === 'waiting_sunat_process') {
+
+                /*
+                 * La boleta todavía fue emitida hoy.
+                 * No intentamos darla de baja todavía.
+                 */
+                if ($sale->isReceiptFromToday()) {
+                    DB::commit();
+
+                    return [
+                        'status' => 'waiting',
+                        'message' => 'Boleta emitida hoy. Se consultará nuevamente mañana.',
+                    ];
+                }
+
+                /*
+                 * Si ya salió del plazo permitido para baja,
+                 * pasamos a requerir Nota de Crédito.
+                 */
+                if (!$sale->isWithinAnnulmentDeadline()) {
+
+                    $sale->annulment_status = 'requires_credit_note';
+                    $sale->annulment_type = 'credit_note';
+                    $sale->annulment_reason =
+                        'Boleta fuera de plazo para baja. Requiere Nota de Crédito.';
+
+                    if (empty($sale->annulment_requested_by)) {
+                        $sale->annulment_requested_by = $systemUserId;
+                    }
+
+                    $sale->save();
+
+                    DB::commit();
+
+                    return [
+                        'status' => 'requires_credit_note',
+                        'message' => 'Boleta fuera de plazo. Requiere Nota de Crédito.',
+                    ];
+                }
+
+                /*
+                 * ========================================================
+                 * YA PASÓ EL DÍA DE EMISIÓN
+                 * ENVIAR ANULACIÓN A NUBEFACT
+                 * ========================================================
+                 */
+                $motivo = $sale->annulment_reason
+                    ?: 'Anulación automática desde cron';
+
+                $sale->annulment_status = 'pending';
+                $sale->annulment_type = 'nubefact_baja';
+
+                $sale->annulment_requested_at =
+                    $sale->annulment_requested_at ?: now();
+
+                if (empty($sale->annulment_requested_by)) {
+                    $sale->annulment_requested_by = $systemUserId;
+                }
+
+                $sale->save();
+
+                /*
+                 * Enviar solicitud de baja.
+                 */
+                $result = $this->anularComprobanteNubefact(
+                    $sale,
+                    $motivo
+                );
+
+                /*
+                 * Persistir respuesta Nubefact/SUNAT.
+                 *
+                 * Gracias a los cambios del Trait:
+                 * - error SOAP     => pending
+                 * - respuesta vacía => pending
+                 * - aceptada       => accepted
+                 */
+                $this->persistNubefactAnnulmentResult(
+                    $sale,
+                    $result,
+                    $motivo
+                );
+
+                $sale->refresh();
+
+                /*
+                 * ========================================================
+                 * REVERSIÓN OPERATIVA INMEDIATA
+                 * ========================================================
+                 *
+                 * Liberamos stock/caja aunque SUNAT todavía esté pendiente.
+                 */
+                if ($sale->internal_reversal_status !== 'reversed') {
+
+                    $this->reverseSaleInternallyInCommand(
+                        $sale,
+                        'Anulación enviada a Nubefact desde cron. Reversión interna aplicada.',
+                        false
+                    );
+
+                    $sale->refresh();
+                }
+
+                /*
+                 * ========================================================
+                 * SUNAT YA ACEPTÓ
+                 * ========================================================
+                 */
+                if ($sale->annulment_status === 'accepted') {
+
+                    $sale->state_annulled = 1;
+                    $sale->annulment_status = 'accepted';
+
+                    $sale->annulment_accepted_at =
+                        $sale->annulment_accepted_at ?: now();
+
+                    $sale->annulled_by =
+                        $sale->annulled_by ?: $systemUserId;
+
+                    $sale->save();
+
+                    DB::commit();
+
+                    return [
+                        'status' => 'accepted',
+                        'message' => 'Anulación enviada y aceptada por SUNAT. Venta marcada como anulada definitivamente.',
+                    ];
+                }
+
+                /*
+                 * ========================================================
+                 * SIGUE PENDIENTE / ERROR TÉCNICO
+                 * ========================================================
+                 */
+                DB::commit();
+
+                return [
+                    'status' => 'pending',
+
+                    'message' => $sale->annulment_sunat_message
+                        ?: 'Anulación enviada a Nubefact. Pendiente de aceptación SUNAT.',
+
+                    'internal_reversal_status' =>
+                        $sale->internal_reversal_status,
+                ];
+            }
+
+            /*
+             * ============================================================
+             * ANULACIÓN YA ENVIADA A NUBEFACT
+             * annulment_status = pending
+             * ============================================================
+             */
+            $motivo = $sale->annulment_reason
+                ?: 'Consulta automática de anulación desde cron';
+
+            /*
+             * Consultar estado.
+             *
+             * Si Nubefact devuelve {}:
+             * consultarAnulacionNubefact() lo normaliza.
+             *
+             * Si devuelve un SOAP error:
+             * persistNubefactAnnulmentResult() lo mantiene pending.
+             */
+            $result = $this->consultarAnulacionNubefact($sale);
+
+            $this->persistNubefactAnnulmentResult(
+                $sale,
+                $result,
+                $motivo
+            );
+
+            $sale->refresh();
+
+            /*
+             * ============================================================
+             * ANULACIÓN ACEPTADA
+             * ============================================================
+             */
+            if ($sale->annulment_status === 'accepted') {
+
+                /*
+                 * Contingencia:
+                 * si por algún motivo no se había aplicado la reversión,
+                 * la aplicamos ahora.
+                 */
+                if ($sale->internal_reversal_status !== 'reversed') {
+
+                    $this->reverseSaleInternallyInCommand(
+                        $sale,
+                        'Anulación aceptada por SUNAT/Nubefact desde cron',
+                        true
+                    );
+
+                    $sale->refresh();
+                }
+
+                /*
+                 * Aunque la reversión ya hubiera ocurrido anteriormente
+                 * con markAsAnnulled=false, ahora que SUNAT confirmó
+                 * marcamos definitivamente la venta.
+                 */
+                $sale->state_annulled = 1;
+                $sale->annulment_status = 'accepted';
+
+                $sale->annulment_accepted_at =
+                    $sale->annulment_accepted_at ?: now();
+
+                $sale->annulled_by =
+                    $sale->annulled_by ?: $systemUserId;
+
+                $sale->save();
+
+                DB::commit();
+
+                return [
+                    'status' => 'accepted',
+                    'message' => 'Anulación aceptada por SUNAT. Venta marcada como anulada definitivamente.',
+                ];
+            }
+
+            /*
+             * ============================================================
+             * RECHAZO DEFINITIVO
+             * ============================================================
+             *
+             * Se conserva para compatibilidad futura.
+             * Actualmente un SOAP error o responseCode no se consideran
+             * automáticamente como rechazo.
+             */
+            if ($sale->annulment_status === 'rejected') {
+
+                DB::commit();
+
+                return [
+                    'status' => 'rejected',
+
+                    'message' => $sale->annulment_error
+                        ?: 'Anulación rechazada por SUNAT.',
+                ];
+            }
+
+            /*
+             * ============================================================
+             * PENDIENTE / RESPUESTA INCONCLUSA / ERROR TÉCNICO
+             * ============================================================
+             *
+             * Aquí puede llegar:
+             *
+             * - SUNAT todavía procesando.
+             * - Nubefact con respuesta vacía.
+             * - SOAP error temporal.
+             * - Respuesta todavía no concluyente.
+             *
+             * NO se vuelve a revertir stock/caja.
+             * Simplemente se intentará nuevamente en otra ejecución.
+             */
+            DB::commit();
+
+            return [
+                'status' => 'pending',
+
+                'message' => $sale->annulment_sunat_message
+                    ?: 'La anulación todavía está pendiente de aceptación SUNAT.',
+
+                'internal_reversal_status' =>
+                    $sale->internal_reversal_status,
+            ];
+
+        } catch (\Throwable $e) {
+
+            DB::rollBack();
+
+            /*
+             * Una excepción de comunicación no convierte la venta
+             * en rejected.
+             *
+             * Como la transacción hace rollback, conservará el estado
+             * que tenía antes de iniciar este procesamiento.
+             */
+            return [
+                'status' => 'error',
+                'message' => $e->getMessage(),
+            ];
+        }
+    }
+
     private function applyCreditNoteInternalReversalInCommand(CreditNote $creditNote): void
     {
         if ($creditNote->internal_reversal_status === 'reversed') {
@@ -692,7 +1508,7 @@ class CheckPendingSunatDocuments extends Command
         $creditNote->save();
     }
 
-    private function reverseCreditNoteStockPartiallyInCommand(CreditNote $creditNote): void
+    private function reverseCreditNoteStockPartiallyInCommandO(CreditNote $creditNote): void
     {
         if ($creditNote->internal_reversal_status === 'reversed') {
             return;
@@ -778,6 +1594,292 @@ class CheckPendingSunatDocuments extends Command
             ->all();
 
         foreach ($inventoryKeysToSync as $key) {
+            $this->syncInventoryLevelFromLots(
+                (int) $key['stock_item_id'],
+                $key['warehouse_id'],
+                $key['location_id']
+            );
+        }
+    }
+
+    private function reverseCreditNoteStockPartiallyInCommand(CreditNote $creditNote): void
+    {
+        if (
+            $creditNote->internal_reversal_status === 'reversed'
+        ) {
+            return;
+        }
+
+        $creditNote->loadMissing([
+            'details.saleDetail',
+            'details.items',
+        ]);
+
+        $inventoryKeysToSync = [];
+
+        foreach ($creditNote->details as $creditNoteDetail) {
+
+            $saleDetail = $creditNoteDetail->saleDetail;
+
+            if (!$saleDetail) {
+                continue;
+            }
+
+            /*
+             * ============================================================
+             * PRODUCTO ITEMEABLE
+             * ============================================================
+             *
+             * Si existen registros asociados en credit_note_detail_items,
+             * devolvemos exactamente los items seleccionados por el usuario.
+             */
+            if ($creditNoteDetail->items->isNotEmpty()) {
+
+                foreach ($creditNoteDetail->items as $selectedItem) {
+
+                    $outputDetail = OutputDetail::where(
+                        'id',
+                        $selectedItem->output_detail_id
+                    )
+                        ->where(
+                            'sale_detail_id',
+                            $saleDetail->id
+                        )
+                        ->where(
+                            'item_id',
+                            $selectedItem->item_id
+                        )
+                        ->lockForUpdate()
+                        ->first();
+
+                    if (!$outputDetail) {
+                        throw new \Exception(
+                            'No se encontró la salida original del item '
+                            . ($selectedItem->item_code
+                                ?: '#' . $selectedItem->item_id)
+                            . '.'
+                        );
+                    }
+
+                    $qtyToApply = (float) (
+                    $selectedItem->quantity ?: 1
+                    );
+
+                    if ($qtyToApply <= 0) {
+                        $qtyToApply = 1;
+                    }
+
+                    $stockLotId =
+                        $selectedItem->stock_lot_id
+                            ?: $outputDetail->stock_lot_id;
+
+                    /*
+                     * ========================================================
+                     * DEVOLVER STOCK AL LOTE ORIGINAL
+                     * ========================================================
+                     */
+                    if (!empty($stockLotId)) {
+
+                        $lot = StockLot::where(
+                            'id',
+                            $stockLotId
+                        )
+                            ->lockForUpdate()
+                            ->first();
+
+                        if (!$lot) {
+                            throw new \Exception(
+                                'No se encontró el lote del item '
+                                . ($selectedItem->item_code
+                                    ?: '#' . $selectedItem->item_id)
+                                . '.'
+                            );
+                        }
+
+                        $lot->qty_on_hand =
+                            (float) $lot->qty_on_hand
+                            + $qtyToApply;
+
+                        $lot->save();
+
+                        $inventoryKeysToSync[] = [
+                            'stock_item_id' =>
+                                (int) $lot->stock_item_id,
+
+                            'warehouse_id' =>
+                                $lot->warehouse_id,
+
+                            'location_id' =>
+                                $lot->location_id,
+                        ];
+                    }
+
+                    /*
+                     * ========================================================
+                     * LIBERAR ITEM
+                     * ========================================================
+                     */
+                    $item = Item::where(
+                        'id',
+                        $selectedItem->item_id
+                    )
+                        ->lockForUpdate()
+                        ->first();
+
+                    if (!$item) {
+                        throw new \Exception(
+                            'No se encontró el item '
+                            . ($selectedItem->item_code
+                                ?: '#' . $selectedItem->item_id)
+                            . '.'
+                        );
+                    }
+
+                    $item->state_item = 'entered';
+                    $item->save();
+
+                    /*
+                     * No eliminamos el OutputDetail.
+                     *
+                     * credit_note_detail_items conserva la relación
+                     * histórica indicando qué item fue devuelto.
+                     */
+                }
+
+                /*
+                 * Ya procesamos exactamente los items de este detalle.
+                 * No debemos ejecutar la lógica normal por cantidad.
+                 */
+                continue;
+            }
+
+            /*
+             * ============================================================
+             * PRODUCTO NORMAL / NO ITEMEABLE
+             * ============================================================
+             */
+            $qtyToReturn =
+                (float) $creditNoteDetail->quantity;
+
+            if ($qtyToReturn <= 0) {
+                continue;
+            }
+
+            $outputDetails = OutputDetail::where(
+                'sale_detail_id',
+                $saleDetail->id
+            )
+                ->whereNull('item_id')
+                ->lockForUpdate()
+                ->get();
+
+            /*
+             * Compatibilidad con registros antiguos
+             * que puedan tener item_id = 0.
+             */
+            if ($outputDetails->isEmpty()) {
+
+                $outputDetails = OutputDetail::where(
+                    'sale_detail_id',
+                    $saleDetail->id
+                )
+                    ->where(function ($query) {
+                        $query->whereNull('item_id')
+                            ->orWhere('item_id', 0);
+                    })
+                    ->lockForUpdate()
+                    ->get();
+            }
+
+            foreach ($outputDetails as $outputDetail) {
+
+                if ($qtyToReturn <= 0) {
+                    break;
+                }
+
+                $qtyFromOutput = (float) (
+                    $outputDetail->percentage ?? 0
+                );
+
+                if ($qtyFromOutput <= 0) {
+                    $qtyFromOutput =
+                        (float) $saleDetail->quantity;
+                }
+
+                $qtyToApply = min(
+                    $qtyToReturn,
+                    $qtyFromOutput
+                );
+
+                if (!empty($outputDetail->stock_lot_id)) {
+
+                    $lot = StockLot::where(
+                        'id',
+                        $outputDetail->stock_lot_id
+                    )
+                        ->lockForUpdate()
+                        ->first();
+
+                    if ($lot) {
+
+                        $lot->qty_on_hand =
+                            (float) $lot->qty_on_hand
+                            + $qtyToApply;
+
+                        $lot->save();
+
+                        $inventoryKeysToSync[] = [
+                            'stock_item_id' =>
+                                (int) $lot->stock_item_id,
+
+                            'warehouse_id' =>
+                                $lot->warehouse_id,
+
+                            'location_id' =>
+                                $lot->location_id,
+                        ];
+                    }
+                }
+
+                $qtyToReturn -= $qtyToApply;
+            }
+
+            /*
+             * Si no logramos encontrar suficiente stock original,
+             * detenemos la operación para no dejar el inventario
+             * parcialmente actualizado.
+             */
+            if ($qtyToReturn > 0.000001) {
+                throw new \Exception(
+                    'No se pudo identificar todo el stock que debe '
+                    . 'retornar para el detalle #'
+                    . $saleDetail->id
+                    . '.'
+                );
+            }
+        }
+
+        /*
+         * ============================================================
+         * SINCRONIZAR INVENTORY LEVELS
+         * ============================================================
+         */
+        $inventoryKeysToSync = collect(
+            $inventoryKeysToSync
+        )
+            ->unique(function ($row) {
+
+                return implode('|', [
+                    $row['stock_item_id'] ?? 'null',
+                    $row['warehouse_id'] ?? 'null',
+                    $row['location_id'] ?? 'null',
+                ]);
+            })
+            ->values()
+            ->all();
+
+        foreach ($inventoryKeysToSync as $key) {
+
             $this->syncInventoryLevelFromLots(
                 (int) $key['stock_item_id'],
                 $key['warehouse_id'],
