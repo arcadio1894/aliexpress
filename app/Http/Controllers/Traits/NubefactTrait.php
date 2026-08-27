@@ -1567,6 +1567,14 @@ trait NubefactTrait
 
         $result = $response->json();
 
+        Log::info('NUBEFACT CONSULTA ANULACION', [
+            'sale_id' => $sale->id,
+            'request_data' => $data,
+            'http_status' => $response->status(),
+            'raw_body' => $response->body(),
+            'json_result' => $result,
+        ]);
+
         if (!$response->ok()) {
             $msg = is_array($result) ? json_encode($result) : $response->body();
             throw new \Exception('Error HTTP consultando anulación en Nubefact: ' . $msg);
