@@ -1990,7 +1990,7 @@ function renderTemplateConsumable(
         const packs = parseInt(pres.packs);
         const unitsEquivalent = parseInt(pres.unitsEquivalent);
 
-        clone.querySelector("[data-consumableDescription]").value = consumable.full_description;
+        clone.querySelector("[data-consumableDescription]").value = consumable.code+" "+consumable.full_description;
         clone.querySelector("[data-consumableUnit]").value = consumable.unit_measure.name;
         clone.querySelector("[data-consumableQuantity]").value = packs.toFixed(2);
         clone.querySelector("[data-consumablePrice]").value = pricePack.toFixed(2);
@@ -2061,7 +2061,7 @@ function renderTemplateConsumable(
     let valorUnitario = precioUnitario / ((100 + parseFloat($igv)) / 100);
     let importeTotal = precioUnitario * qtyVisible;
 
-    clone.querySelector("[data-consumableDescription]").value = consumable.full_description;
+    clone.querySelector("[data-consumableDescription]").value = consumable.code+" "+consumable.full_description;
     clone.querySelector("[data-consumableUnit]").value = consumable.unit_measure.name;
     clone.querySelector("[data-consumableQuantity]").value = qtyVisible.toFixed(2);
     clone.querySelector("[data-consumableValor]").value = valorUnitario.toFixed(2);

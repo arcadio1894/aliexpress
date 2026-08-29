@@ -336,7 +336,7 @@
                                                 <div class="form-group">
                                                     <input type="text"
                                                            class="form-control form-control-sm"
-                                                           value="{{ $consumable->stockItem->display_name }}"
+                                                           value="{{ $consumable->material->code." ".$consumable->stockItem->display_name }}"
                                                            data-consumableDescription
                                                            title="{{ $itemTooltip }}"
                                                            {{ $consumable->stockItem->ui_color ? 'style=color:' . $consumable->stockItem->ui_color : '' }}

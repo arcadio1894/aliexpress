@@ -296,7 +296,7 @@ function renderTemplateConsumable(
         : '';
 
     // visibles
-    clone.querySelector("[data-consumableDescription]").value = consumable.full_description;
+    clone.querySelector("[data-consumableDescription]").value = consumable.code+" "+consumable.full_description;
     clone.querySelector("[data-consumableUnit]").value = consumable.unit_measure.name;
     clone.querySelector("[data-consumableQuantity]").value = parseFloat(qtyVisible).toFixed(2);
     clone.querySelector("[data-consumablePrice]").value = parseFloat(pricePU).toFixed(2);
