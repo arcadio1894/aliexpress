@@ -177,7 +177,7 @@ class QuoteSaleController extends Controller
                 ->where('enable_status', 1)
                 ->get()
                 ->filter(function ($material) use ($search) {
-                    return stripos($material->full_name, $search) !== false;
+                    return stripos($material->code." ".$material->full_name, $search) !== false;
                 });
 
             foreach ($materials as $material) {
@@ -216,7 +216,7 @@ class QuoteSaleController extends Controller
                         'stock_item_id' => $stockItem->id,
                         'text' => $text,
                         'full_name' => $material->full_name,
-                        'display_name' => $stockItem->display_name,
+                        'display_name' => $material->code." ".$stockItem->display_name,
                         'variant_text' => $variantText,
                         'unit' => optional($stockItem->unitMeasure)->name ?: optional($material->unitMeasure)->name,
                         'code' => $material->code,
